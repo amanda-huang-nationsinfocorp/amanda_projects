@@ -248,7 +248,7 @@ exclude_cols = [
 feature_cols = [col for col in df_clean.columns if col not in exclude_cols]
 cat_features = ['day_name', 'month_name'] # CatBoost handles these natively  
 
-# ------------------------------------------------------------------
+# --------------------------------------------------------------
 # 2. ISOLATE THE FINAL HOLDOUT SET
 # -------------------------------------------------------------------
 # The last 100 days are locked away for the ultimate deployment test
@@ -715,20 +715,6 @@ df_intraday.dtypes
 
 append(df = df_intraday, tb_name = 'CALL_VOLUME_PREDICTIONS_30_MIN') 
 
-
-# In[433]:
-
-
-
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
 
 
 
