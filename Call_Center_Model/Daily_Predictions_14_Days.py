@@ -39,10 +39,6 @@ from datetime import date
 
 pd.set_option('display.max_columns', None)
 
-
-# In[3]:
-
-
 url = URL(
     user='BITEAM',
     password='B1sense@22',
@@ -51,9 +47,6 @@ url = URL(
 )
 engine = create_engine(url) 
 connection = engine.connect()
-
-
-# In[7]:
 
 
 holiday_function = '''
