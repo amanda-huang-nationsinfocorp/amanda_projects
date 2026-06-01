@@ -737,63 +737,72 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
+# ==========================================
+# 1. DATA PREPARATION & HOLDOUT SPLIT
+# ==========================================
+
 # 1. CRITICAL: Sort chronologically to prevent time leakage
 df['request_datetime'] = pd.to_datetime(df['request_datetime'])
 df = df.sort_values('request_datetime').reset_index(drop=True)
 
+# --- CREATE OOT HOLDOUT SET ---
+# Reserve the most recent 15% of data as the true blind holdout
+split_index = int(len(df) * 0.85)
+
+# df_cv will be used for TimeSeriesSplit
+df_cv = df.iloc[:split_index].copy().reset_index(drop=True)
+# df_holdout is locked away until the very end
+df_holdout = df.iloc[split_index:].copy().reset_index(drop=True)
+
 # 2. Define Features to Drop 
 cols_to_drop = [
-    'is_m0',
-    'jluvr', 
-    'label',                             
-    'lead_user_agent',                   
-    'applicant_current_address_state',   
-    'applicant_employment_type',         
-    'bank_name',                        
-    'applicant_date_of_birth',           
-    'request_datetime',                  
-    'applicant_income_last_pay_day',     
-    'applicant_income_next_pay_day',
-    'inquiry_date',                     
-    'price_decile',
-    'employer',                   
-    'bank_account_bank_name',
-    'seller_minimum_price',
-    'seller_3d_conversion_rate'
+    'is_m0', 'jluvr', 'label', 'lead_user_agent',                   
+    'applicant_current_address_state', 'applicant_employment_type',         
+    'bank_name', 'applicant_date_of_birth', 'request_datetime',                  
+    'applicant_income_last_pay_day', 'applicant_income_next_pay_day',
+    'inquiry_date', 'price_decile', 'employer',                   
+    'bank_account_bank_name', 'seller_minimum_price', 'seller_3d_conversion_rate'
 ]
-# 1. Get the list of all toxic features from your evaluation
-toxic_features = feature_importances[feature_importances['Importance_Score'] <= 0]['Feature'].tolist()
-final_cols_to_drop = cols_to_drop + toxic_features
 
-# Create X and y
-X = df.drop(columns=[c for c in final_cols_to_drop if c in df.columns])
-y = df['is_m0']
+# NOTE: If you have toxic features from earlier evaluations, uncomment the next two lines:
+# toxic_features = feature_importances[feature_importances['Importance_Score'] <= 0]['Feature'].tolist()
+# final_cols_to_drop = cols_to_drop + toxic_features
+final_cols_to_drop = cols_to_drop
+
+# Create X and y for the CV set
+X_cv = df_cv.drop(columns=[c for c in final_cols_to_drop if c in df_cv.columns])
+y_cv = df_cv['is_m0']
 
 # Identify Categorical Columns
-cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+cat_cols = X_cv.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
 
 # 3. Setup Time-Series Cross-Validation (Walk-Forward Validation)
 n_splits = 3
 tscv = TimeSeriesSplit(n_splits=n_splits) 
 
+
+# ==========================================
+# 2. WALK-FORWARD CROSS-VALIDATION
+# ==========================================
+
 train_aucs = []
 test_aucs = []
+best_iterations = []
 
 print("Starting Walk-Forward Time-Series Validation...\n")
 
-for fold, (train_index, test_index) in enumerate(tscv.split(X)):
+for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
     print(f"--- FOLD {fold + 1} ---")
     
     # Split the data chronologically for this fold
-    X_train, X_test = X.iloc[train_index].copy(), X.iloc[test_index].copy()
-    y_train, y_test = y.iloc[train_index].copy(), y.iloc[test_index].copy()
+    X_train, X_test = X_cv.iloc[train_index].copy(), X_cv.iloc[test_index].copy()
+    y_train, y_test = y_cv.iloc[train_index].copy(), y_cv.iloc[test_index].copy()
     
     # 4. Bulletproof Categorical Handling
     for col in cat_cols:
-        # Convert to string and fill NaNs to prevent CatBoost errors
         X_train[col] = X_train[col].astype(str).replace('nan', 'unknown').str.strip()
         X_test[col]  = X_test[col].astype(str).replace('nan', 'unknown').str.strip()
-        
+          
     # 5. Handle Imbalance for the current training fold
     positive_count = y_train.sum()
     negative_count = len(y_train) - positive_count
@@ -803,18 +812,18 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X)):
     train_pool = Pool(data=X_train, label=y_train, cat_features=cat_cols)
     test_pool = Pool(data=X_test, label=y_test, cat_features=cat_cols)
     
-    # 7. "Anti-Memorization" Hyperparameters
+    # 7. "Anti-Memorization" Hyperparameters (Original)
     params = {
         'iterations': 1500,          
         'learning_rate': 0.03,       
-        'depth': 4,                  # Lower depth to prevent memorizing specific rows
-        'l2_leaf_reg': 20,           # High regularization to penalize complexity
-        'max_ctr_complexity': 1,     # Stop CatBoost from creating complex feature crosses
-        'colsample_bylevel': 0.7,    # Randomly select 70% of features for splits
+        'depth': 6,                  # Lower depth to prevent memorizing specific rows
+        'l2_leaf_reg': 10,           # High regularization to penalize complexity
+        'max_ctr_complexity': 5,     # Stop CatBoost from creating complex feature crosses
+        'colsample_bylevel': 0.8,    # Randomly select 80% of features for splits
         'subsample': 0.8,            # Randomly select 80% of rows for each tree
         'loss_function': 'Logloss',
         'eval_metric': 'AUC',
-        #'scale_pos_weight': scale_pos_weight,
+        #'scale_pos_weight': scale_pos_weight, # Uncomment to apply dynamically
         'has_time': True,            
         'random_seed': 42,
         'verbose': 0                 # Silenced tree outputs to keep the loop readable
@@ -831,6 +840,8 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X)):
     
     # 9. Evaluate Fold Performance
     best_iteration = model.get_best_iteration()
+    best_iterations.append(best_iteration)
+    
     y_train_pred_proba = model.predict_proba(X_train)[:, 1]
     y_test_pred_proba = model.predict_proba(X_test)[:, 1]
     
@@ -848,11 +859,50 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X)):
     print(f"Test AUC:       {fold_test_auc:.4f}")
     print(f"Gap:            {(fold_train_auc - fold_test_auc):.4f}\n")
 
-# 10. Final Model Evaluation
-print("=== FINAL CROSS-VALIDATION RESULTS ===")
+# 10. Final CV Evaluation
+print("=== FINAL CROSS-VALIDATION RESULTS ===")  
 print(f"Average Train AUC: {np.mean(train_aucs):.4f} (+/- {np.std(train_aucs):.4f})")
 print(f"Average Test AUC:  {np.mean(test_aucs):.4f} (+/- {np.std(test_aucs):.4f})")
-print("======================================")
+print("======================================\n") 
+
+
+# ==========================================
+# 3. EVALUATE FINAL MODEL ON OOT HOLDOUT
+# ==========================================
+print("Training final model on all CV data and evaluating on blind Holdout...")
+
+# Prep full CV dataset (trains on 85% of total data)
+X_full_cv = X_cv.copy()
+for col in cat_cols:
+    X_full_cv[col] = X_full_cv[col].astype(str).replace('nan', 'unknown').str.strip()
+
+full_cv_pool = Pool(data=X_full_cv, label=y_cv, cat_features=cat_cols)
+
+# Train using original params, but limit 'iterations' to the average best iteration 
+# from CV to prevent overfitting, as we have no early_stopping evaluation set here.
+optimal_iterations = int(np.mean(best_iterations))
+final_params = params.copy()
+final_params['iterations'] = optimal_iterations
+
+final_model = CatBoostClassifier(**final_params)
+final_model.fit(full_cv_pool)
+
+# Prepare the Holdout set (the remaining 15% of future data)
+X_holdout = df_holdout.drop(columns=[c for c in final_cols_to_drop if c in df_holdout.columns])
+y_holdout = df_holdout['is_m0']
+
+for col in cat_cols:
+    X_holdout[col] = X_holdout[col].astype(str).replace('nan', 'unknown').str.strip()
+
+# Final Blind Evaluation
+holdout_pred_proba = final_model.predict_proba(X_holdout)[:, 1]
+holdout_auc = roc_auc_score(y_holdout, holdout_pred_proba)
+
+print(f"\n=== TRUE BLIND HOLDOUT PERFORMANCE ===")
+print(f"Holdout Size:      {len(X_holdout):,}")
+print(f"Holdout Positives: {y_holdout.sum():,} | Rate: {(y_holdout.sum()/len(y_holdout))*100:.2f}%")
+print(f"Holdout AUC:       {holdout_auc:.4f}")
+print("========================================")
 
 # %% SHAP
 import shap
@@ -936,6 +986,7 @@ feature_importances[feature_importances['Importance_Score'] <= 0]['Feature']
 
 # %% Confustion Matrix
 from sklearn.metrics import confusion_matrix
+
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
@@ -947,17 +998,17 @@ print("\nGenerating Confusion Matrix for Final Test Fold...")
 
 # 1. Define your business threshold
 # If your goal is to buy/approve the leads MOST likely to convert, you set a high threshold.
-# Let's say you only want to buy the top 20% highest-converting leads:
-threshold = np.percentile(y_test_pred_proba, 20)
-print(f"Custom Threshold Applied: {threshold:.4f} (Buying the Top 20% of Leads)")
+# Let's say you only want to buy the top 30% highest-converting leads:
+threshold = np.percentile(holdout_pred_proba,30)
+print(f"Custom Threshold Applied: {threshold:.4f}")
 
 # 2. Convert raw probabilities to binary predictions
 # If probability >= threshold, we predict 1 (Will Convert / Approve Lead)
 # If probability < threshold, we predict 0 (Will Not Convert / Reject Lead)
-y_test_pred_binary = (y_test_pred_proba >= threshold).astype(int)
+y_test_pred_binary = (holdout_pred_proba >= threshold).astype(int)
 
 # 3. Calculate the confusion matrix
-cm = confusion_matrix(y_test, y_test_pred_binary)
+cm = confusion_matrix(y_holdout, y_test_pred_binary)
 
 # 4. Extract metrics for business context
 tn, fp, fn, tp = cm.ravel()
