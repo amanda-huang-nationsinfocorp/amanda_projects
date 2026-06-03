@@ -104,12 +104,15 @@ trade_lines AS (
         jluvr, 
         count(*) as total_account_count, 
         count_if(account_current_status = 'Open') as total_open_account,
+        COUNT_IF(DATEDIFF('month', account_open_date, CURRENT_DATE()) <= 6) AS account_opened_within_6_month,
         count_if(account_type in ('Revolving', 'Credit Line', 'Open Account', 'Mortgage')) as revolving_account_count,
         count_if(account_type = 'Installment') as installment_account_count,
         count_if(account_type = 'Colletion') as collection_account_count,
         sum(high_balance) as total_high_balance,
         sum(current_balance) as total_current_balance,
-        div0(sum(current_balance), sum(high_balance)) as credit_utilization_ratio,
+        avg(credit_limit) as credit_limit_avg,
+        sum(case when account_current_status = 'Open' then credit_limit else null end) as open_credit_limit_total,
+        div0(sum(monthly_payment), sum(case when account_current_status = 'Open' then credit_limit else null end)) as credit_utilization_ratio,
         max(DATEDIFF('month', account_open_date, CURRENT_DATE()) / 12.0) as earliest_account_open_year,
         min(DATEDIFF('month', account_open_date, CURRENT_DATE()) / 12.0) as latest_account_open_year,
         count_if(account_status = 'Derogatory') as derogatory_account_count,
@@ -123,6 +126,9 @@ trade_lines AS (
         count_if(open_account_type = 'Educational') as educational_account_count,
         count_if(lower(open_account_type) like 'credit card') as credit_card_account_count,
         count_if(open_account_type = 'Charge account') as charge_account_count,
+        count_if(creditor_category = 'BNPL_Fintech_Advance') as fintech_creditor_count,
+        count_if(open_account_type = 'Unsecured loan' and creditor_category = 'BNPL_Fintech_Advance') as unsecured_loan_fintech_count, 
+        count_if(open_account_type = 'Unsecured loan' and creditor_category = 'Personal_Installment_Payday_Loan') as unsecured_loan_ploan_count, 
         sum(case when account_current_status = 'Open' then monthly_payment end) as current_monthly_payment_total,
         div0(sum(case when account_current_status = 'Open' then monthly_payment end), sum(current_balance)) as payment_burden_ratio,
         avg(monthly_payment) as historic_monthly_payment_avg,
@@ -729,7 +735,7 @@ df = engineer_employer_features(df)
 
 
 # %% MODEL TRAINING
-import pandas as pd
+import pandas as pd 
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -741,12 +747,12 @@ from sklearn.model_selection import TimeSeriesSplit
 # 1. DATA PREPARATION & HOLDOUT SPLIT
 # ==========================================
 
-# 1. CRITICAL: Sort chronologically to prevent time leakage
+# 1. CRITICAL: Sort chronologically to prevent time leakage 
 df['request_datetime'] = pd.to_datetime(df['request_datetime'])
 df = df.sort_values('request_datetime').reset_index(drop=True)
 
 # --- CREATE OOT HOLDOUT SET ---
-# Reserve the most recent 15% of data as the true blind holdout
+# Reserve the most recent 15% of data as the true blind holdout 
 split_index = int(len(df) * 0.85)
 
 # df_cv will be used for TimeSeriesSplit
@@ -754,7 +760,7 @@ df_cv = df.iloc[:split_index].copy().reset_index(drop=True)
 # df_holdout is locked away until the very end
 df_holdout = df.iloc[split_index:].copy().reset_index(drop=True)
 
-# 2. Define Features to Drop 
+# 2. Define Features to Drop  
 cols_to_drop = [
     'is_m0', 'jluvr', 'label', 'lead_user_agent',                   
     'applicant_current_address_state', 'applicant_employment_type',         
@@ -764,10 +770,16 @@ cols_to_drop = [
     'bank_account_bank_name', 'seller_minimum_price', 'seller_3d_conversion_rate'
 ]
 
-# NOTE: If you have toxic features from earlier evaluations, uncomment the next two lines:
-# toxic_features = feature_importances[feature_importances['Importance_Score'] <= 0]['Feature'].tolist()
-# final_cols_to_drop = cols_to_drop + toxic_features
-final_cols_to_drop = cols_to_drop
+toxic_features = ['collection_account_count', 'is_employer_usps','is_thin_file', 'is_traffic_surge',
+ 'is_public_assistance_afdc','is_self_employed_agg','ios_device_age_proxy','transferred_account_count', 'revolving_account_count',
+ 'high_risk_price_heavy_seeker','is_morning_application', 'seller_morning_combo','is_fintech_bank','bank_inquiry_ratio',
+ 'secured_loan_account_count','is_employer_walmart','is_employer_fedex','is_toxic_employer_tier','loan_amount',
+ 'seller_name','seller_7d_conversion_rate','local_lead_hour_of_day', 'loan_to_age_ratio', 'seller_7d_lead_volume', 'days_till_next_pay',
+ 'local_request_datetime', 'late_60_total', 'past_due_to_current_balance_ratio', 'inquiry_within_6_month', 'bin_tier_2_perc_past_3_days',
+ 'bin_tier_blacklist_perc_past_3_days', 'applicant_current_address_years', 'seller_device_combo', 'seller_value_index'
+] 
+
+final_cols_to_drop = cols_to_drop + toxic_features
 
 # Create X and y for the CV set
 X_cv = df_cv.drop(columns=[c for c in final_cols_to_drop if c in df_cv.columns])
@@ -776,14 +788,13 @@ y_cv = df_cv['is_m0']
 # Identify Categorical Columns
 cat_cols = X_cv.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
 
-# 3. Setup Time-Series Cross-Validation (Walk-Forward Validation)
+# 3. Setup Time-Series Cross-Validation (Walk-Forward Validation) 
 n_splits = 3
 tscv = TimeSeriesSplit(n_splits=n_splits) 
 
-
-# ==========================================
+# ============================================
 # 2. WALK-FORWARD CROSS-VALIDATION
-# ==========================================
+# ============================================
 
 train_aucs = []
 test_aucs = []
@@ -798,7 +809,7 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
     X_train, X_test = X_cv.iloc[train_index].copy(), X_cv.iloc[test_index].copy()
     y_train, y_test = y_cv.iloc[train_index].copy(), y_cv.iloc[test_index].copy()
     
-    # 4. Bulletproof Categorical Handling
+    # 4. Bulletproof Categorical Handling 
     for col in cat_cols:
         X_train[col] = X_train[col].astype(str).replace('nan', 'unknown').str.strip()
         X_test[col]  = X_test[col].astype(str).replace('nan', 'unknown').str.strip()
@@ -866,12 +877,12 @@ print(f"Average Test AUC:  {np.mean(test_aucs):.4f} (+/- {np.std(test_aucs):.4f}
 print("======================================\n") 
 
 
-# ==========================================
-# 3. EVALUATE FINAL MODEL ON OOT HOLDOUT
-# ==========================================
+# ===============================================
+# 3. EVALUATE FINAL MODEL ON OOT HOLDOUT SET
+# ===============================================
 print("Training final model on all CV data and evaluating on blind Holdout...")
 
-# Prep full CV dataset (trains on 85% of total data)
+# Prep full CV dataset (trains on 85% of total data) 
 X_full_cv = X_cv.copy()
 for col in cat_cols:
     X_full_cv[col] = X_full_cv[col].astype(str).replace('nan', 'unknown').str.strip()
@@ -879,17 +890,17 @@ for col in cat_cols:
 full_cv_pool = Pool(data=X_full_cv, label=y_cv, cat_features=cat_cols)
 
 # Train using original params, but limit 'iterations' to the average best iteration 
-# from CV to prevent overfitting, as we have no early_stopping evaluation set here.
+# from CV to prevent overfitting, as we have no early_stopping evaluation set here.  
 optimal_iterations = int(np.mean(best_iterations))
 final_params = params.copy()
 final_params['iterations'] = optimal_iterations
 
 final_model = CatBoostClassifier(**final_params)
-final_model.fit(full_cv_pool)
+final_model.fit(full_cv_pool) 
 
-# Prepare the Holdout set (the remaining 15% of future data)
+# Prepare the Holdout set (the remaining 15% of future data) 
 X_holdout = df_holdout.drop(columns=[c for c in final_cols_to_drop if c in df_holdout.columns])
-y_holdout = df_holdout['is_m0']
+y_holdout = df_holdout['is_m0'] 
 
 for col in cat_cols:
     X_holdout[col] = X_holdout[col].astype(str).replace('nan', 'unknown').str.strip()
@@ -902,7 +913,7 @@ print(f"\n=== TRUE BLIND HOLDOUT PERFORMANCE ===")
 print(f"Holdout Size:      {len(X_holdout):,}")
 print(f"Holdout Positives: {y_holdout.sum():,} | Rate: {(y_holdout.sum()/len(y_holdout))*100:.2f}%")
 print(f"Holdout AUC:       {holdout_auc:.4f}")
-print("========================================")
+print("========================================") 
 
 # %% SHAP
 import shap
@@ -942,35 +953,42 @@ plt.title("SHAP Feature Importance (Impact on predicting is_m0=1)", fontsize=14)
 plt.tight_layout()
 plt.show()
 
-# %%
-# --- RUN THIS AFTER YOUR CROSS-VALIDATION LOOP ---
+# %% FEATURE IMPORTANCE
 print("\nEvaluating True Feature Importance on Out-of-Time Data...")
 
-# Create a clean 80/20 time-split for this evaluation
+# 1. Define X and y from the full dataframe FIRST
+X = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
+y = df['is_m0']
+
+# 2. Re-identify categorical columns based on X
+cat_cols = X.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
+
+# 3. Create a clean 80/20 time-split for this evaluation
 split_idx = int(len(df) * 0.8)
 X_tr, X_te = X.iloc[:split_idx].copy(), X.iloc[split_idx:].copy()
 y_tr, y_te = y.iloc[:split_idx].copy(), y.iloc[split_idx:].copy()
 
-# Bulletproof Categorical Handling
+# 4. Bulletproof Categorical Handling
 for col in cat_cols: 
     X_tr[col] = X_tr[col].astype(str).replace('nan', 'unknown').str.strip()
     X_te[col]  = X_te[col].astype(str).replace('nan', 'unknown').str.strip()
 
-# Create Pools
+# 5. Create Pools
 eval_train_pool = Pool(X_tr, y_tr, cat_features=cat_cols)
 eval_test_pool = Pool(X_te, y_te, cat_features=cat_cols)
 
-# Train a dedicated model for feature evaluation
+# 6. Train a dedicated model for feature evaluation
+# (Assuming your 'params' dictionary is defined earlier in your script)
 eval_model = CatBoostClassifier(**params)
 eval_model.fit(eval_train_pool, eval_set=eval_test_pool, early_stopping_rounds=150, verbose=0)
 
-# Calculate LossFunctionChange Importance (Evaluates on the TEST pool)
+# 7. Calculate LossFunctionChange Importance
 importance_values = eval_model.get_feature_importance(
     data=eval_test_pool,
     type='LossFunctionChange'
 )
 
-# Create a clean DataFrame
+# 8. Create a clean DataFrame
 feature_importances = pd.DataFrame({
     'Feature': eval_model.feature_names_,
     'Importance_Score': importance_values
@@ -982,24 +1000,22 @@ print(feature_importances.head(10))
 print("\n--- BOTTOM 15 TOXIC FEATURES (These cause Overfitting) ---")
 print(feature_importances.tail(15))
 
-feature_importances[feature_importances['Importance_Score'] <= 0]['Feature']
+# Extract toxic features to drop them in the main training loop later
+toxic_features = feature_importances[feature_importances['Importance_Score'] <= 0]['Feature'].tolist()
+print(f"\nIdentified {len(toxic_features)} toxic features to drop.")
 
 # %% Confustion Matrix
 from sklearn.metrics import confusion_matrix
 
-import seaborn as sns
-import matplotlib.pyplot as plt
-import numpy as np
-
-# ==========================================
-# GENERATE CONFUSION MATRIX (CONVERSION FOCUS)
-# ==========================================
+# ==============================================
+# GENERATE CONFUSION MATRIX (CONVERSION FOCUS) 
+# ==============================================
 print("\nGenerating Confusion Matrix for Final Test Fold...")
-
+ 
 # 1. Define your business threshold
 # If your goal is to buy/approve the leads MOST likely to convert, you set a high threshold.
-# Let's say you only want to buy the top 30% highest-converting leads:
-threshold = np.percentile(holdout_pred_proba,30)
+# Let's say you only want to buy the top 30% highest-converting leads: 
+threshold = np.percentile(holdout_pred_proba,20)
 print(f"Custom Threshold Applied: {threshold:.4f}")
 
 # 2. Convert raw probabilities to binary predictions
