@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+#%% IMPORTS
 
-
+from networkx import display
 import pandas as pd
 import numpy as np
 import json
@@ -317,10 +317,6 @@ date_cols = [
 for col in date_cols:
     if col in df.columns:
         df[col] = pd.to_datetime(df[col], errors='coerce')
-
-# 1. Drop the order_id column
-if 'order_id' in df.columns:
-    df = df.drop(columns=['order_id'])
 
 # 2. Identify categorical and numeric columns
 categorical_cols = df.select_dtypes(include=['object', 'category']).columns
@@ -750,6 +746,8 @@ from sklearn.model_selection import TimeSeriesSplit
 # 1. CRITICAL: Sort chronologically to prevent time leakage 
 df['request_datetime'] = pd.to_datetime(df['request_datetime'])
 df = df.sort_values('request_datetime').reset_index(drop=True)
+# Preserve the original sorted row positions so we can recover order_id later
+df['_orig_index'] = df.index
 
 # --- CREATE OOT HOLDOUT SET ---
 # Reserve the most recent 15% of data as the true blind holdout 
@@ -762,7 +760,7 @@ df_holdout = df.iloc[split_index:].copy().reset_index(drop=True)
 
 # 2. Define Features to Drop  
 cols_to_drop = [
-    'is_m0', 'jluvr', 'label', 'lead_user_agent',                   
+    'is_m0', 'order_id','jluvr', 'label', 'lead_user_agent',                   
     'applicant_current_address_state', 'applicant_employment_type',         
     'bank_name', 'applicant_date_of_birth', 'request_datetime',                  
     'applicant_income_last_pay_day', 'applicant_income_next_pay_day',
@@ -783,7 +781,7 @@ final_cols_to_drop = cols_to_drop + toxic_features
 
 # Create X and y for the CV set
 X_cv = df_cv.drop(columns=[c for c in final_cols_to_drop if c in df_cv.columns])
-y_cv = df_cv['is_m0']
+y_cv = df_cv['is_m0'] 
 
 # Identify Categorical Columns
 cat_cols = X_cv.select_dtypes(include=['object', 'category', 'string']).columns.tolist()
@@ -793,14 +791,14 @@ n_splits = 3
 tscv = TimeSeriesSplit(n_splits=n_splits) 
 
 # ============================================
-# 2. WALK-FORWARD CROSS-VALIDATION
+# 2. WALK-FORWARD CROSS-VALIDATION   
 # ============================================
-
-train_aucs = []
+   
+train_aucs = []  
 test_aucs = []
 best_iterations = []
 
-print("Starting Walk-Forward Time-Series Validation...\n")
+print("Starting Walk-Forward Time-Series Validation...\n") 
 
 for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
     print(f"--- FOLD {fold + 1} ---")
@@ -809,12 +807,12 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
     X_train, X_test = X_cv.iloc[train_index].copy(), X_cv.iloc[test_index].copy()
     y_train, y_test = y_cv.iloc[train_index].copy(), y_cv.iloc[test_index].copy()
     
-    # 4. Bulletproof Categorical Handling 
+    # 4. Bulletproof Categorical Handling   
     for col in cat_cols:
         X_train[col] = X_train[col].astype(str).replace('nan', 'unknown').str.strip()
         X_test[col]  = X_test[col].astype(str).replace('nan', 'unknown').str.strip()
           
-    # 5. Handle Imbalance for the current training fold
+    # 5. Handle Imbalance for the current training fold 
     positive_count = y_train.sum()
     negative_count = len(y_train) - positive_count
     scale_pos_weight = negative_count / positive_count if positive_count > 0 else 1
@@ -827,8 +825,8 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
     params = {
         'iterations': 1500,          
         'learning_rate': 0.03,       
-        'depth': 6,                  # Lower depth to prevent memorizing specific rows
-        'l2_leaf_reg': 10,           # High regularization to penalize complexity
+        'depth': 6,                  
+        'l2_leaf_reg': 10,           
         'max_ctr_complexity': 5,     # Stop CatBoost from creating complex feature crosses
         'colsample_bylevel': 0.8,    # Randomly select 80% of features for splits
         'subsample': 0.8,            # Randomly select 80% of rows for each tree
@@ -837,7 +835,7 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
         #'scale_pos_weight': scale_pos_weight, # Uncomment to apply dynamically
         'has_time': True,            
         'random_seed': 42,
-        'verbose': 0                 # Silenced tree outputs to keep the loop readable
+        'verbose': 0                 # Silenced tree outputs to keep the loop readable 
     }
     
     # 8. Train Model
@@ -845,21 +843,21 @@ for fold, (train_index, test_index) in enumerate(tscv.split(X_cv)):
     model.fit(
         train_pool,
         eval_set=test_pool,
-        early_stopping_rounds=150,   
+        early_stopping_rounds=150,    
         use_best_model=True          
     )
-    
+     
     # 9. Evaluate Fold Performance
     best_iteration = model.get_best_iteration()
     best_iterations.append(best_iteration)
-    
+     
     y_train_pred_proba = model.predict_proba(X_train)[:, 1]
     y_test_pred_proba = model.predict_proba(X_test)[:, 1]
     
     fold_train_auc = roc_auc_score(y_train, y_train_pred_proba)
     fold_test_auc = roc_auc_score(y_test, y_test_pred_proba)
     
-    train_aucs.append(fold_train_auc)
+    train_aucs.append(fold_train_auc) 
     test_aucs.append(fold_test_auc)
      
     print(f"  Train Size: {len(X_train):,} | Positives: {y_train.sum():,} | Rate: {(y_train.sum()/len(y_train))*100:.2f}%")
@@ -875,7 +873,7 @@ print("=== FINAL CROSS-VALIDATION RESULTS ===")
 print(f"Average Train AUC: {np.mean(train_aucs):.4f} (+/- {np.std(train_aucs):.4f})")
 print(f"Average Test AUC:  {np.mean(test_aucs):.4f} (+/- {np.std(test_aucs):.4f})")
 print("======================================\n") 
-
+ 
 
 # ===============================================
 # 3. EVALUATE FINAL MODEL ON OOT HOLDOUT SET
@@ -894,7 +892,7 @@ full_cv_pool = Pool(data=X_full_cv, label=y_cv, cat_features=cat_cols)
 optimal_iterations = int(np.mean(best_iterations))
 final_params = params.copy()
 final_params['iterations'] = optimal_iterations
-
+  
 final_model = CatBoostClassifier(**final_params)
 final_model.fit(full_cv_pool) 
 
@@ -907,7 +905,7 @@ for col in cat_cols:
 
 # Final Blind Evaluation
 holdout_pred_proba = final_model.predict_proba(X_holdout)[:, 1]
-holdout_auc = roc_auc_score(y_holdout, holdout_pred_proba)
+holdout_auc = roc_auc_score(y_holdout, holdout_pred_proba) 
 
 print(f"\n=== TRUE BLIND HOLDOUT PERFORMANCE ===")
 print(f"Holdout Size:      {len(X_holdout):,}")
@@ -1004,8 +1002,8 @@ print(feature_importances.tail(15))
 toxic_features = feature_importances[feature_importances['Importance_Score'] <= 0]['Feature'].tolist()
 print(f"\nIdentified {len(toxic_features)} toxic features to drop.")
 
-# %% Confustion Matrix
-from sklearn.metrics import confusion_matrix
+# %% Confustion Matrix 
+from sklearn.metrics import confusion_matrix 
 
 # ==============================================
 # GENERATE CONFUSION MATRIX (CONVERSION FOCUS) 
@@ -1013,14 +1011,12 @@ from sklearn.metrics import confusion_matrix
 print("\nGenerating Confusion Matrix for Final Test Fold...")
  
 # 1. Define your business threshold
-# If your goal is to buy/approve the leads MOST likely to convert, you set a high threshold.
-# Let's say you only want to buy the top 30% highest-converting leads: 
-threshold = np.percentile(holdout_pred_proba,20)
+threshold = np.percentile(holdout_pred_proba, 10) 
 print(f"Custom Threshold Applied: {threshold:.4f}")
 
 # 2. Convert raw probabilities to binary predictions
 # If probability >= threshold, we predict 1 (Will Convert / Approve Lead)
-# If probability < threshold, we predict 0 (Will Not Convert / Reject Lead)
+# If probability < threshold, we predict 0 (Will Not Convert / Reject Lead) 
 y_test_pred_binary = (holdout_pred_proba >= threshold).astype(int)
 
 # 3. Calculate the confusion matrix
@@ -1029,12 +1025,12 @@ cm = confusion_matrix(y_holdout, y_test_pred_binary)
 # 4. Extract metrics for business context
 tn, fp, fn, tp = cm.ravel()
 print(f"\n--- Conversion Business Breakdown ---")
-print(f"True Positives  (TP): {tp:,} (Golden Leads: We bought them, and they converted!)")
+print(f"True Positives  (TP): {tp:,} (Golden Leads: We bought them, and they converted!)") 
 print(f"False Positives (FP): {fp:,} (Wasted Money: We bought them, but they didn't convert.)")
 print(f"True Negatives  (TN): {tn:,} (Money Saved: We rejected them, and they wouldn't have converted anyway.)")
 print(f"False Negatives (FN): {fn:,} (Missed Opportunity: We rejected them, but they actually converted.)")
 
-# 5. Visualize it beautifully using Seaborn
+# 5. Visualize it beautifully using Seaborn 
 plt.figure(figsize=(8, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', cbar=False,
             xticklabels=['Reject (Predict 0)', 'Buy/Approve (Predict 1)'],
@@ -1043,5 +1039,97 @@ sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', cbar=False,
 plt.title('Conversion Confusion Matrix', fontsize=15, pad=15)
 plt.ylabel('Actual Outcome', fontsize=12, fontweight='bold')
 plt.xlabel('Model Action', fontsize=12, fontweight='bold')
-plt.tight_layout()
+plt.tight_layout() 
 plt.show()
+
+# %% Extract Order IDs from the ORIGINAL df
+
+# Check for common variations of the order ID column name in the original 'df'  
+id_col_name = 'order_id'
+
+if id_col_name is not None:
+    print(f"Success: Found ID column as '{id_col_name}' in the original dataframe.")
+    
+    # Grab the exact number of rows from the end of the original df to match the holdout set
+    holdout_length = len(df_holdout)
+    holdout_order_id = df[id_col_name].tail(holdout_length).reset_index(drop=True)
+    
+    # We use .values on y_holdout to ensure it aligns perfectly with the numpy array y_test_pred_binary
+    y_actual_array = y_holdout.values 
+    
+    tp_order_ids = holdout_order_id[(y_actual_array == 1) & (y_test_pred_binary == 1)] 
+    fn_order_ids = holdout_order_id[(y_actual_array == 1) & (y_test_pred_binary == 0)]
+    
+    print(f"\nTrue Positive count: {len(tp_order_ids):,}") 
+    print(f"False Negative count: {len(fn_order_ids):,}")
+else:
+    print("\nWARNING: Could not find an order ID column in the original df.") 
+    print("Here are the columns currently in your original df:") 
+    print(df.columns.tolist())
+
+all_target_ids = pd.concat([tp_order_ids, fn_order_ids])
+formatted_ids = ",".join([f"'{str(order_id)}'" for order_id in all_target_ids])
+fn_formatted_ids = ",".join([f"'{str(order_id)}'" for order_id in fn_order_ids]) 
+
+orders_query = f"""
+    SELECT 
+    count(distinct case when is_m0 = 1 then order_id else null e nd) as m_0,
+    div0(sum(case when is_sale = 1 and is_daydiff_interval_txn_order_030 then transaction_amount else 0 end),
+    count (distinct case when is_m0 = 1 and is_daydiff_interval_txn_order_030 then order_id else null end)) as cltv_30
+    FROM DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM 
+    WHERE order_id IN ({fn_formatted_ids}) 
+    and order_date < '2026-05-08' 
+"""
+
+# 3. Execute the query and load directly into a DataFrame
+# (Assuming your active Snowflake connection object is named 'conn')
+with engine.connect() as con:
+    con.execute(text("use database dbt_prod"))
+    df_orders = pd.read_sql(orders_query, con)
+
+df_orders
+
+
+
+
+#%%
+import pandas as pd
+
+print("Calculating Seller Breakdown for Rejected Leads (Holdout Set)...\n")
+
+# 1. Create an analysis dataframe locked strictly to y_holdout's index 
+
+df_analysis = pd.DataFrame(index=y_holdout.index)
+
+# 2. Pull seller_name directly from your holdout dataframe
+df_analysis['seller_name'] = df_holdout['seller_name'] 
+
+# 3. Add Actual and Predicted (Using the exact variables from your CM code)
+df_analysis['actual'] = y_holdout
+df_analysis['predicted'] = y_test_pred_binary 
+
+# 4. Filter for True Negatives (Actual 0, Predicted 0) 
+#    and False Negatives (Actual 1, Predicted 0)
+tn_mask = (df_analysis['actual'] == 0) & (df_analysis['predicted'] == 0)
+fn_mask = (df_analysis['actual'] == 1) & (df_analysis['predicted'] == 0) 
+
+# 5. Get counts by seller_name
+tn_counts = df_analysis[tn_mask]['seller_name'].value_counts().rename('True_Negatives')
+fn_counts = df_analysis[fn_mask]['seller_name'].value_counts().rename('False_Negatives') 
+
+# 6. Combine into a single summary table
+seller_summary = pd.concat([tn_counts, fn_counts], axis=1).fillna(0).astype(int)
+
+# 7. Add Total Rejected and sort by highest missed opportunities
+seller_summary['Total_Rejected'] = seller_summary['True_Negatives'] + seller_summary['False_Negatives']
+seller_summary = seller_summary.sort_values(by='False_Negatives', ascending=False)
+
+print("--- HOLDOUT SET Seller Breakdown: Leads We Rejected (Predicted 0) ---")
+print("True Negatives  = Junk leads we correctly rejected (Saved Money)") 
+print("False Negatives = Good leads we accidentally rejected (Missed Opportunity)\n")
+
+display(seller_summary.head(20))
+
+# --- Quick Math Check to prove it matches your Confusion Matrix ---
+table_sum = seller_summary['Total_Rejected'].sum()
+print(f"\nDiagnostic: The seller table accounts for {table_sum:,} rejected leads.")
