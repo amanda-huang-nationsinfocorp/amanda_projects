@@ -1041,7 +1041,7 @@ plt.ylabel('Actual Outcome', fontsize=12, fontweight='bold')
 plt.xlabel('Model Action', fontsize=12, fontweight='bold')
 plt.tight_layout() 
 plt.show()
-
+ 
 # %% Extract Order IDs from the ORIGINAL df
 
 # Check for common variations of the order ID column name in the original 'df'  
