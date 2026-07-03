@@ -12,12 +12,13 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 from catboost import CatBoostClassifier
-
+import os
+import joblib
 
 #%%  Fetch Data from Snowflake
-
 # Start fetching data directly from Snowflake
 ctx = snowflake.connector.connect(
+    
     user='BITEAM',
     password='B1sense@22',
     account='YXBYZCG-MVA06208',
@@ -35,7 +36,25 @@ cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_DATA 
 # This is drastically faster than pd.read_sql()
 df = cur.fetch_pandas_all()
 
-#%% Model V2
+#%%
+# =====================================================================
+# 4.5 Aggressive Memory Cleanup (Prevent Kernel Crash)
+# =====================================================================
+print("Freeing up RAM before training...")
+import gc
+
+# Delete the massive initial dataframes that are no longer needed
+del df, past_data, train_df, stop_df
+
+# Delete the training and stopping Pandas splits because they are now safely compressed inside the CatBoost Pools!
+del X_train, y_train, X_stop, y_stop
+
+# Force the Python garbage collector to instantly dump them from RAM
+gc.collect()
+
+print("RAM cleared. Ready to train.")
+
+#%% Model Training
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -59,7 +78,7 @@ if 'LAST_DECLINE_CODE' in sampled_df.columns:
 sampled_df = sampled_df.sort_values('TRANSACTION_DATETIME').reset_index(drop=True)
 
 # =======================================================================
-# 2. Data Processing & Pre-Split Vectorized Imputation 
+# 2. Data Processing & Pre-Split Vectorized I
 # =======================================================================
 print("Processing and Imputing Data...")
 # Drop core IDs and target
@@ -80,7 +99,7 @@ numeric_cols = sampled_df.columns.difference(cat_features + text_features + drop
 sampled_df[numeric_cols] = sampled_df[numeric_cols].fillna(-1)
 
 # =====================================================================
-# 3. Hybrid Split (Chronological OOT + Random In-Sample)
+# 3. Hybrid Split (Chronological OOT + Random In-Sample)y
 # =====================================================================
 print("Splitting data (Hybrid OOT + Random)...")
 
@@ -126,15 +145,15 @@ stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=tex
 # =====================================================================
 print("Training Base Model...")
 base_model = CatBoostClassifier(
-    iterations=2000,           
-    learning_rate=0.05,          # Updated Learning Rate
+    iterations=5000,           
+    learning_rate=0.06,          # Updated Learning Rate
     depth=5,
     task_type="CPU",           
     eval_metric='Logloss',
     custom_metric=['AUC'],       
-    l2_leaf_reg=5,
+    l2_leaf_reg=8,
     thread_count=-1,
-    early_stopping_rounds=50,  
+    early_stopping_rounds=100,  
     verbose=50,
     random_state=42,
     cat_features=cat_features,
@@ -216,212 +235,479 @@ auc_drop = roc_auc_score(y_random_test, random_probs) - roc_auc_score(y_oot_test
 print(f"\nTemporal Degradation Penalty (AUC Drop): {auc_drop:.4f}")
 print("*(If this drop is large, the recent data is highly 'immature' or behavior shifted over time)*")
 
+
+#%% Save Model
+script_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(script_dir, 'calibrated_catboost_model.joblib')
+
+# 2. Package the model and the exact feature lists into one dictionary
+# This ensures your prediction script applies the exact same preprocessing
+model_artifact = {
+    'model': calibrated_model,
+    'cat_features': cat_features,
+    'text_features': text_features,
+    'drop_cols': drop_cols
+}
+
+# 3. Save the artifact to the script's directory
+joblib.dump(model_artifact, model_path)
+
+print(f"Model artifact successfully saved to: {model_path}")
+
+#%% Predictions
+
+# 1. Load the Model and Metadata
+script_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(script_dir, 'calibrated_catboost_model.joblib')
+
+print("Loading model artifact...")
+artifact = joblib.load(model_path)
+
+# Extract components from the artifact
+calibrated_model = artifact['model']
+cat_features = artifact['cat_features']
+text_features = artifact['text_features']
+drop_cols = artifact['drop_cols']
+
+# 2. Load and Preprocess New Data 
+print("Loading new data...")
+# Replace this with your actual new dataset
+# new_df = pd.read_csv('new_transactions.csv') 
+
+# --- FOR DEMONSTRATION ONLY: Creating a dummy dataframe ---
+new_df = pd.DataFrame() 
+# ----------------------------------------------------------
+
+print("Applying strict preprocessing rules...")
+
+# 1. Format specific string columns if they exist
+if 'DECLINE_CODE' in new_df.columns:
+    new_df['DECLINE_CODE'] = new_df['DECLINE_CODE'].astype(str)
+    new_df['DECLINE_FAMILY'] = new_df['DECLINE_CODE'].str[0]
+
+if 'LAST_DECLINE_CODE' in new_df.columns:
+    new_df['LAST_DECLINE_CODE'] = new_df['LAST_DECLINE_CODE'].astype(str)
+
+# 2. Drop core IDs and target (ignoring errors if they aren't in the new data)
+X_new = new_df.drop(columns=drop_cols, errors='ignore').copy()
+
+# 3. Apply Imputations based on saved feature lists
+# Categorical/Text Imputation
+existing_cat_text = [c for c in (cat_features + text_features) if c in X_new.columns]
+if existing_cat_text:
+    X_new[existing_cat_text] = X_new[existing_cat_text].fillna('unknown').astype(str)
+
+# Numeric Imputation
+numeric_cols = X_new.columns.difference(cat_features + text_features)
+if len(numeric_cols) > 0:
+    X_new[numeric_cols] = X_new[numeric_cols].fillna(-1)
+
+# 3. Make Predictions 
+print("Generating predictions...")
+
+# Ensure column order matches training exactly
+feature_names = calibrated_model.feature_names_in_
+X_new = X_new[feature_names]
+
+# Get the probability of the positive class (IS_EVENTUALLY_SUCCESSFUL = 1)
+probabilities = calibrated_model.predict_proba(X_new)[:, 1]
+
+# Attach probabilities back to the original dataframe
+new_df['SUCCESS_PROBABILITY'] = probabilities
+
+# Save the results
+# output_path = os.path.join(script_dir, 'predictions_output.csv')
+# new_df.to_csv(output_path, index=False)
+# print(f"Predictions saved to: {output_path}")
+
+print("Done.")
+
 #%% Confusion Matrix
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+import seaborn as sns 
 from sklearn.metrics import confusion_matrix
 
-# 1. Choose your Threshold
-threshold = 0.05 
+def plot_business_confusion_matrix(y_true, y_probs, threshold=0.05, dataset_name="Test Set"):
+    """
+    Evaluates business impact based on model predictions and a given threshold.
+    """
+    # 2. Convert probabilities to hard predictions
+    y_pred = (y_probs >= threshold).astype(int)
 
-# 2. Convert probabilities to hard predictions
-# (Assuming y_prob and y_test are already defined from your model output)
-y_pred = (y_prob >= threshold).astype(int)
+    # 3. Calculate the Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred)
 
-# 3. Calculate the Confusion Matrix
-cm = confusion_matrix(y_test, y_pred)
+    # 4. Calculate Percentages and Create Custom Labels ugk 
+    # Divide each cell by the total number of predictions to get the % of total
+    cm_percentages = cm / np.sum(cm)
 
-# 4. Calculate Percentages and Create Custom Labels
-# Divide each cell by the total number of predictions to get the % of total
-cm_percentages = cm / np.sum(cm)
+    # Zip the raw counts and the percentages together into a formatted string
+    labels = [f"{count}\n({percentage:.1%})" for count, percentage in zip(cm.flatten(), cm_percentages.flatten())]
+    # Reshape the list of strings back into a 2x2 grid to match the heatmap
+    labels = np.asarray(labels).reshape(2, 2)
 
-# Zip the raw counts and the percentages together into a formatted string
-labels = [f"{count}\n({percentage:.1%})" for count, percentage in zip(cm.flatten(), cm_percentages.flatten())]
-# Reshape the list of strings back into a 2x2 grid to match the heatmap
-labels = np.asarray(labels).reshape(2, 2)
+    # 5. Visualize the Matrix
+    plt.figure(figsize=(8, 6))
 
-# 5. Visualize the Matrix
-plt.figure(figsize=(8, 6))
+    # Notice we changed annot=labels and fmt='' (empty string) so Seaborn accepts our custom text
+    sns.heatmap(cm, annot=labels, fmt='', cmap='Blues', cbar=False, annot_kws={'size': 14},
+                xticklabels=['Predicted Fail (0)', 'Predicted Success (1)'],
+                yticklabels=['Actual Fail (0)', 'Actual Success (1)'])
 
-# Notice we changed annot=labels and fmt='' (empty string) so Seaborn accepts our custom text
-sns.heatmap(cm, annot=labels, fmt='', cmap='Blues', cbar=False, annot_kws={'size': 14},
-            xticklabels=['Predicted Fail (0)', 'Predicted Success (1)'],
-            yticklabels=['Actual Fail (0)', 'Actual Success (1)'])
+    plt.title(f'Confusion Matrix: {dataset_name}\n(Threshold: {threshold})', fontsize=14, pad=15)
+    plt.xlabel('What the Model Predicted', fontsize=12, labelpad=10)
+    plt.ylabel('What Actually Happened', fontsize=12, labelpad=10)
+    plt.tight_layout()
+    plt.show()
 
-plt.title(f'Confusion Matrix (Threshold: {threshold})', fontsize=14, pad=15)
-plt.xlabel('What the Model Predicted', fontsize=12, labelpad=10)
-plt.ylabel('What Actually Happened', fontsize=12, labelpad=10)
-plt.tight_layout()
-plt.show()
+    # 6. Print the business breakdown
+    tn, fp, fn, tp = cm.ravel()
+    print(f"\n--- Confusion Matrix Breakdown: {dataset_name} (Threshold: {threshold}) ---")
+    print(f"True Negatives (TN):  {tn:,} ({cm_percentages[0,0]:.1%}) -> Correctly cut off")
+    print(f"False Positives (FP): {fp:,} ({cm_percentages[0,1]:.1%}) -> Wasted $0.10 retry")
+    print(f"False Negatives (FN): {fn:,} ({cm_percentages[1,0]:.1%}) -> Missed revenue!")
+    print(f"True Positives (TP):  {tp:,} ({cm_percentages[1,1]:.1%}) -> Successfully collected")
 
-# 6. Print the business breakdown
-tn, fp, fn, tp = cm.ravel()
-print(f"\n--- Confusion Matrix Breakdown (Threshold: {threshold}) ---")
-print(f"True Negatives (TN):  {tn} ({cm_percentages[0,0]:.1%}) -> Correctly cut off")
-print(f"False Positives (FP): {fp} ({cm_percentages[0,1]:.1%}) -> Wasted $0.10 retry")
-print(f"False Negatives (FN): {fn} ({cm_percentages[1,0]:.1%}) -> Missed revenue!")
-print(f"True Positives (TP):  {tp} ({cm_percentages[1,1]:.1%}) -> Successfully collected")
+# =====================================================================
+# Generate the Confusion Matrices using variables from your training script
+# =====================================================================
+
+# 1. Check the Out-Of-Time (OOT) Test Set (Usually the most important for business reality)
+plot_business_confusion_matrix(y_true=y_oot_test, 
+                               y_probs=oot_probs, 
+                               threshold=0.03, 
+                               dataset_name="OOT Test Set (Strict Future)")
+
+# 2. Check the Random Holdout Test Set
+plot_business_confusion_matrix(y_true=y_random_test, 
+                               y_probs=random_probs, 
+                               threshold=0.03, 
+                               dataset_name="Random Test Set (In-Sample)")
 
 
-#%% Cost benefit analysis 
+
+#%% Order based confusion matrix
 import pandas as pd
 import numpy as np
-import time
+import matplotlib.pyplot as plt
+import seaborn as sns 
+from sklearn.metrics import confusion_matrix
 
-print("Fetching raw data directly from Snowflake...")
-start_time = time.time()
+def plot_order_level_confusion_matrix(order_ids, y_true, y_probs, threshold=0.05, dataset_name="Test Set"):
+    """
+    Evaluates business impact at the ORDER level.
+    Rules:
+    - If Actual=1: If ANY transaction is predicted 0 (cut off), order is False Negative.
+                   Otherwise (ALL predicted 1), it's a True Positive.
+    - If Actual=0: If ANY transaction is predicted 1 (allowed), order is False Positive.
+                   Otherwise (ALL predicted 0), it's a True Negative.
+    """
+    # 1. Create a temporary dataframe to group predictions by order
+    df = pd.DataFrame({
+        'order_id': order_ids,
+        'y_true': y_true,
+        'y_pred': (y_probs >= threshold).astype(int)
+    })
 
-# 1. Fetch raw data using Snowflake (Assuming 'ctx' is already connected)
-cur = ctx.cursor()
-cur.execute("USE DATABASE dbt_prod")
-cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_DATA") 
+    # 2. Group by order_id and evaluate the predictions
+    grouped = df.groupby('order_id').agg(
+        y_true=('y_true', 'first'),                     # Actual outcome is the same for the whole order
+        has_pred_0=('y_pred', lambda x: (x == 0).any()), # Did we predict 0 for ANY transaction?
+        has_pred_1=('y_pred', lambda x: (x == 1).any())  # Did we predict 1 for ANY transaction?
+    )
 
-# Fetch directly to a Pandas DataFrame using Arrow
-raw_df = cur.fetch_pandas_all()
+    # 3. Apply the Business Logic to categorize each order
+    FN = ((grouped['y_true'] == 1) & (grouped['has_pred_0'])).sum()
+    TP = ((grouped['y_true'] == 1) & (~grouped['has_pred_0'])).sum()
+    FP = ((grouped['y_true'] == 0) & (grouped['has_pred_1'])).sum()
+    TN = ((grouped['y_true'] == 0) & (~grouped['has_pred_1'])).sum()
 
-cur.close()
-ctx.close() 
+    # 4. Build the Confusion Matrix array and calculate percentages
+    cm = np.array([[TN, FP], 
+                   [FN, TP]])
+    cm_percentages = cm / np.sum(cm)
 
-# Ensure the raw datetime column is formatted correctly for comparison
-raw_df['TRANSACTION_DATETIME'] = pd.to_datetime(raw_df['TRANSACTION_DATETIME'])
-print(f"Raw data fetched successfully in {time.time() - start_time:.2f} seconds.\n")
+    labels = [f"{count:,}\n({percentage:.1%})" for count, percentage in zip(cm.flatten(), cm_percentages.flatten())]
+    labels = np.asarray(labels).reshape(2, 2)
 
-print("Calculating Cost Savings and Missed Revenue...")
-calc_start = time.time()
+    # 5. Visualize the Matrix
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=labels, fmt='', cmap='Blues', cbar=False, annot_kws={'size': 14},
+                xticklabels=['Predicted Fail (0)', 'Predicted Success (1)'],
+                yticklabels=['Actual Fail (0)', 'Actual Success (1)'])
 
-# 2. Isolate predictions strictly to the unseen testing dataset (test_df)
-predictions_df = test_df.copy()
-predictions_df['PREDICTED_PROBABILITY'] = y_prob
-predictions_df['TRANSACTION_DATETIME'] = pd.to_datetime(predictions_df['TRANSACTION_DATETIME'])
+    plt.title(f'Order-Level Confusion Matrix: {dataset_name}\n(Threshold: {threshold})', fontsize=14, pad=15)
+    plt.xlabel('Order-Level Prediction Outcome', fontsize=12, labelpad=10)
+    plt.ylabel('Actual Order Outcome', fontsize=12, labelpad=10)
+    plt.tight_layout()
+    plt.show()
 
-threshold = 0.02
+    # 6. Print the business breakdown
+    print(f"\n--- Order-Level Breakdown: {dataset_name} (Threshold: {threshold}) ---")
+    print(f"Total Unique Orders:  {np.sum(cm):,}")
+    print(f"True Negatives (TN):  {TN:,} ({cm_percentages[0,0]:.1%}) -> Entire bad order correctly cut off")
+    print(f"False Positives (FP): {FP:,} ({cm_percentages[0,1]:.1%}) -> Allowed at least one retry on a doomed order")
+    print(f"False Negatives (FN): {FN:,} ({cm_percentages[1,0]:.1%}) -> Killed a good order prematurely (Missed revenue!)")
+    print(f"True Positives (TP):  {TP:,} ({cm_percentages[1,1]:.1%}) -> Allowed all retries, successfully collected")
 
-# 3. Calculate Cost Savings (0.10 * count of True Negatives)
-# A True Negative is when the model predicts < 0.30 (Fail) AND the actual outcome was 0 (Fail)
-y_pred = (y_prob >= threshold).astype(int)
-y_actual = predictions_df['IS_EVENTUALLY_SUCCESSFUL'].values
+print("\nGenerating Order-Level Confusion Matrices...")
 
-tn_count = ((y_pred == 0) & (y_actual == 0)).sum()
-cost_savings = tn_count * 0.10
-
-# 4. Find the EXACT Cutoff Moments strictly from the test set predictions
-cutoffs = predictions_df[predictions_df['PREDICTED_PROBABILITY'] < threshold]
-
-# Get the absolute first time the model said "Stop" for each order in the test set
-first_cutoffs = cutoffs.groupby('ORDER_ID')['TRANSACTION_DATETIME'].min().reset_index()
-first_cutoffs = first_cutoffs.rename(columns={'TRANSACTION_DATETIME': 'CUTOFF_TIME'})
-
-# 5. Merge the Test Set Cutoffs with the RAW DATABASE
-# This attaches the test-set cutoff timestamp to the unfiltered real-world data
-merged_raw_df = raw_df.merge(first_cutoffs, on='ORDER_ID', how='inner')
-
-# 6. Filter for True Missed Revenue (Fixing the Blind Spot)
-# Look for rows that happened STRICTLY AFTER the cutoff time 
-# AND where the transaction actually succeeded ('accepted')
-true_missed_opportunities = merged_raw_df[
-    (merged_raw_df['TRANSACTION_DATETIME'] > merged_raw_df['CUTOFF_TIME']) & 
-    (merged_raw_df['TRANSACTION_STATUS'].str.lower() == 'accepted') 
-]
-
-# Deduplicate by INVOICE_ID so we only count the final successful payment amount once per invoice
-unique_true_missed = true_missed_opportunities.drop_duplicates(subset=['ORDER_ID', 'INVOICE_ID'])
-
-total_missed_revenue = unique_true_missed['TRANSACTION_AMOUNT'].sum()
-orders_affected = unique_true_missed['ORDER_ID'].nunique()
-
-net_profit = cost_savings - total_missed_revenue
-
-print(f"Calculations completed in {time.time() - calc_start:.2f} seconds!\n")
-
-# 7. Final ROI Output
-print("="*50)
-print(f" 💰 FINAL ROI REPORT (TEST SET | THRESHOLD: {threshold}) 💰")
-print("="*50)
-print(f"Total True Negatives:           {tn_count:,}")
-print(f"Total Retry Cost Saved:        + ${cost_savings:,.2f}")
-print(f"Total Missed Revenue (FN):     - ${total_missed_revenue:,.2f}")
-print("-" * 50)
-if net_profit > 0:
-    print(f"NET FINANCIAL IMPACT:          + ${net_profit:,.2f} (PROFITABLE)")
-else:
-    print(f"NET FINANCIAL IMPACT:          - ${abs(net_profit):,.2f} (LOSS)")
-print("="*50)
-print(f"* Missed revenue came from {orders_affected} prematurely cancelled orders.")
-
+# 2. Evaluate the Random Holdout Test Set (In-Sample)
+plot_order_level_confusion_matrix(
+    order_ids=random_test_df['ORDER_ID'].values, 
+    y_true=y_random_test.values, 
+    y_probs=random_probs, 
+    threshold=0.03, 
+    dataset_name="Random Test Set (In-Sample)"
+)
 
 #%% Shap
 import shap
 import matplotlib.pyplot as plt
+from catboost import Pool
 
-# ==============================================================================
-# 1. PREPARATION: Sample Data & Extract Base Estimator
-# ==============================================================================
+# =====================================================================
+# 9. SHAP Analysis on Random Test Set (Optimized & Bug-Fixed)
+# =====================================================================
+print("\n--- Starting SHAP Analysis ---")
 
-print("Sampling data for SHAP (avoiding OOM on 35M rows)...")
-# 50,000 rows gives a highly statistically significant SHAP distribution 
-# without taking 3 hours to compute.
-X_shap = X_test.sample(n=min(50000, len(X_test)), random_state=42)
-
-# ==============================================================================
-# 2. CALCULATE SHAP VALUES
-# ==============================================================================
-
-print("Calculating SHAP values using the base CatBoost model...")
-# Initialize the TreeExplainer. CatBoost is highly optimized for this.
+# 1. Initialize the SHAP Explainer using the base_model
 explainer = shap.TreeExplainer(base_model)
 
-# Calculate SHAP values. 
-# Note: For classification, this returns the log-odds impact.
-shap_values = explainer.shap_values(X_shap)
+# 2. Sample the data
+sample_size = min(20000, len(X_random_test))
+X_shap = X_random_test.sample(n=sample_size, random_state=42)
 
-# ==============================================================================
-# 3. GENERATE DIAGNOSTIC PLOTS
-# ==============================================================================
+# ---------------------------------------------------------
+# THE FIX: Manually create a CatBoost Pool for SHAP
+# This bypasses SHAP's internal converter and ensures text_features are respected
+# ---------------------------------------------------------
+shap_pool = Pool(X_shap, cat_features=cat_features, text_features=text_features)
 
-# A. Global Feature Importance (Bar Chart)
-# This will show you exactly which features drive the most expected value.
-plt.figure(figsize=(10, 8))
-plt.title("Feature Importance (Mean Absolute SHAP Value)")
+print(f"Calculating SHAP values for a random sample of {len(X_shap):,} rows...")
+# Pass the Pool, not the DataFrame, to avoid the float conversion error
+shap_values = explainer.shap_values(shap_pool)
+
+# 3. Global Feature Importance (Bar Plot)
+plt.figure(figsize=(10, 6))
+plt.title("SHAP Global Feature Importance")
+# We still pass X_shap here so the plot can pull the correct feature names and values
 shap.summary_plot(shap_values, X_shap, plot_type="bar", show=False)
 plt.tight_layout()
 plt.show()
 
-# B. Directional Impact (Summary Dot Plot)
-# Crucial for understanding HOW features impact the prediction.
-# E.g., Does a high RETRY_COUNT push the probability up or down?
-plt.figure(figsize=(10, 8))
-plt.title("Directional Feature Impact on Eventual Success")
+# 4. Detailed Summary Plot (Beeswarm)
+plt.figure(figsize=(10, 6))
+plt.title("SHAP Directional Summary Plot")
 shap.summary_plot(shap_values, X_shap, show=False)
 plt.tight_layout()
 plt.show()
 
-# ==============================================================================
-# 4. TARGETED DEPENDENCE PLOTS (To validate Data Engineering fixes)
-# ==============================================================================
-# Use these specific plots to validate the data engineering fixes I suggested.
+# 5. Local Explanation (Waterfall plot for a single transaction)
+print("\nGenerating Local Explanation for Sample Observation 0...")
 
-# Validating the "Payday Window" fix:
-# Look for non-linear spikes around the 1st, 15th, and 30th. If they exist, 
-# your model is begging for an explicit IS_PAYDAY_WINDOW boolean feature.
-if 'RETRY_DAY_OF_MONTH' in X_shap.columns:
-    plt.figure(figsize=(8, 6))
-    shap.dependence_plot("RETRY_DAY_OF_MONTH", shap_values, X_shap, show=False)
-    plt.title("SHAP Dependence: Retry Day of Month")
-    plt.tight_layout()
-    plt.show()
+# We also need a manual Pool for the single observation
+row_df = X_shap.iloc[[0]]
+row_pool = Pool(row_df, cat_features=cat_features, text_features=text_features)
 
-# Validating the "Payment Frequency Magnitude" fix:
-# If you mapped '1w' to 7 and '1m' to 30, this plot will show if the model 
-# treats the continuous magnitude differently based on the OFFER_AMOUNT.
-if 'OFFER_AMOUNT' in X_shap.columns:
-    plt.figure(figsize=(8, 6))
-    # interaction_index='auto' usually picks the most correlated feature, 
-    # but you can force it to check PAYMENT_FREQUENCY logic.
-    shap.dependence_plot("OFFER_AMOUNT", shap_values, X_shap, show=False)
-    plt.title("SHAP Dependence: Offer Amount")
-    plt.tight_layout()
-    plt.show()
+# Generate the Explanation object
+shap_explanation = explainer(row_pool)
+
+# Manually attach the original data and feature names to the Explanation object 
+# so the waterfall plot knows how to label the graph
+shap_explanation.data = row_df.values
+shap_explanation.feature_names = row_df.columns.tolist()
+
+plt.figure(figsize=(10, 6))
+plt.title("SHAP Waterfall Plot: Explaining Sample Observation 0")
+shap.plots.waterfall(shap_explanation[0], show=False)
+plt.tight_layout()
+plt.show()
+
+#%% ECLTV based cancellation 
+import pandas as pd
+import numpy as np
+import time
+
+# =====================================================================
+# 1. Configuration Settings (Easy to change!)
+# =====================================================================
+THRESHOLD = 0.03
+CLTV_THRESHOLD = 15.0  
+
+# Put the exact partner names you want to evaluate in this list. 
+# If you want to evaluate EVERYONE, just leave the list empty like this: TARGET_PARTNERS = []
+TARGET_PARTNERS = []
+
+# 2. Fetch only the required columns from the CLTV table
+cur = ctx.cursor()
+cur.execute("SELECT ORDER_ID, CLTV_PRED_MEAN FROM DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER") 
+cltv_df = cur.fetch_pandas_all()
+cur.close()
+
+# 3. Bind predictions, actuals, AND CLTV directly into the DataFrame FIRST
+predictions_df = random_test_df.copy() 
+predictions_df['PREDICTED_PROBABILITY'] = random_probs 
+predictions_df['ACTUAL_OUTCOME'] = np.array(y_random_test)
+predictions_df['PREDICTED_OUTCOME'] = (random_probs >= THRESHOLD).astype(int)
+
+# NEW: Merge the CLTV data immediately so we can use it in our decision logic
+# Using a left merge ensures we don't drop rows if a CLTV happens to be missing
+predictions_df = predictions_df.merge(cltv_df, on='ORDER_ID', how='left')
+
+# Fill any completely missing CLTVs with 0 so the model still cuts them off safely
+predictions_df['CLTV_PRED_MEAN'] = predictions_df['CLTV_PRED_MEAN'].fillna(0)
+
+# =====================================================================
+# *** THE NEW BUSINESS RULE ***
+# A transaction is ONLY cancelled if the model predicts 0 AND the CLTV is < 5
+# =====================================================================
+predictions_df['IS_CANCELLED'] = ((predictions_df['PREDICTED_OUTCOME'] == 0) & 
+                                  (predictions_df['CLTV_PRED_MEAN'] < CLTV_THRESHOLD)).astype(int)
 
 
-#%%
+# 4. Filter by Super Partner 
+if TARGET_PARTNERS:
+    predictions_df = predictions_df[predictions_df['SUPER_PARTNER_ID_NAME'].isin(TARGET_PARTNERS)]
+    partner_label = f"Filtered ({len(TARGET_PARTNERS)} Partners)"
+    print(f"Filtering down to target partners. Rows remaining: {len(predictions_df):,}")
+else:
+    partner_label = "ALL Partners"
+    print(f"Evaluating all partners. Total rows: {len(predictions_df):,}")
+
+
+# =====================================================================
+# 5. Calculate Cost Savings (True Negatives)
+# =====================================================================
+# How many unique orders had at least one retry cancelled?
+cancelled_mask = (predictions_df['IS_CANCELLED'] == 1)
+total_orders_cancelled = predictions_df[cancelled_mask]['ORDER_ID'].nunique()
+
+# A True Negative is now: We ACTUALLY cancelled it, AND the real outcome was 0
+tn_mask = (predictions_df['IS_CANCELLED'] == 1) & (predictions_df['ACTUAL_OUTCOME'] == 0)
+tn_count = tn_mask.sum()
+cost_savings = tn_count * 0.10
+
+# =====================================================================
+# 6. Calculate True Missed Revenue (False Negatives x CLTV)
+# =====================================================================
+# A False Negative is now: We ACTUALLY cancelled it, BUT the real outcome was 1
+fn_mask = (predictions_df['IS_CANCELLED'] == 1) & (predictions_df['ACTUAL_OUTCOME'] == 1)
+
+# Extract unique orders so we only sum the missed CLTV once per affected order
+unique_fn_orders = predictions_df[fn_mask].drop_duplicates(subset=['ORDER_ID'])
+
+total_missed_revenue = unique_fn_orders['CLTV_PRED_MEAN'].sum()
+orders_affected = unique_fn_orders['ORDER_ID'].nunique()
+
+# Calculate final net impact
+net_profit = cost_savings - total_missed_revenue
+
+# Safe division to prevent errors if total_orders_cancelled is 0
+profit_per_cancel = (net_profit / total_orders_cancelled) if total_orders_cancelled > 0 else 0
+
+# =====================================================================
+# 7. Final ROI Output
+# =====================================================================
+print("="*65)
+print(f" 💰 FINAL ROI REPORT (RANDOM TEST SET) 💰")
+print(f" Model Threshold: {THRESHOLD} | CLTV Max Limit: ${CLTV_THRESHOLD}")
+print(f" Segment: {partner_label}")
+print("="*65)
+print(f"Total True Negatives:           {tn_count:,}")
+print(f"Total Retry Cost Saved:        + ${cost_savings:,.2f}")
+print(f"Total Missed Revenue (FN CLTV):- ${total_missed_revenue:,.2f}")
+print("-" * 65)
+if net_profit > 0:
+    print(f"NET FINANCIAL IMPACT:                + ${net_profit:,.2f} (PROFITABLE)")
+    print(f"NET FINANCIAL IMPACT/CANCELATION:    + ${profit_per_cancel:,.6f} (PROFITABLE)")
+else:
+    print(f"NET FINANCIAL IMPACT:                - ${abs(net_profit):,.2f} (LOSS)")
+    print(f"NET FINANCIAL IMPACT/CANCELATION:    - ${abs(profit_per_cancel):,.6f} (LOSS)")
+print("="*65)
+print(f"* We cancelled {total_orders_cancelled:,} unique orders total.")
+print(f"* Missed revenue came from {orders_affected:,} prematurely cancelled orders.")
+
+
+#%% Grid search ecltv 
+import numpy as np
+import pandas as pd
+import time
+
+print("Starting ROI Grid Search Optimization...")
+start_time = time.time()
+
+# =====================================================================
+# 1. Define the ranges you want to test
+# =====================================================================
+# Test probability thresholds from 0.01 to 0.50 in steps of 0.05
+probability_thresholds = np.arange(0.01, 0.50, 0.02) 
+
+# Test these specific CLTV limits
+cltv_thresholds = [1.0, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0]
+
+# =====================================================================
+# 2. Extract raw NumPy arrays for massive speedup in the loop
+# =====================================================================
+probs = predictions_df['PREDICTED_PROBABILITY'].values
+actuals = predictions_df['ACTUAL_OUTCOME'].values
+cltvs = predictions_df['CLTV_PRED_MEAN'].values
+order_ids = predictions_df['ORDER_ID'].values
+
+results = []
+
+# =====================================================================
+# 3. Run the Grid Search
+# =====================================================================
+for thresh in probability_thresholds:
+    # Model predicts failure (0) when probability is LESS than threshold
+    pred_fail = (probs < thresh)
+    
+    for cltv_limit in cltv_thresholds:
+        # Business rule allows cancellation (Must be predicted fail AND under CLTV limit)
+        is_cancelled = pred_fail & (cltvs < cltv_limit)
+        
+        # Cost Savings (True Negatives)
+        tn_mask = is_cancelled & (actuals == 0)
+        cost_savings = np.sum(tn_mask) * 0.10
+        
+        # Missed Revenue (False Negatives)
+        fn_mask = is_cancelled & (actuals == 1)
+        
+        # Grab the arrays strictly for the False Negatives
+        fn_order_ids = order_ids[fn_mask]
+        fn_cltvs = cltvs[fn_mask]
+        
+        # Put into a quick temp DataFrame to drop duplicate orders
+        # (Ensures we only sum the missed CLTV once per order)
+        temp_df = pd.DataFrame({'ORDER_ID': fn_order_ids, 'CLTV': fn_cltvs})
+        unique_missed_orders = temp_df.drop_duplicates(subset=['ORDER_ID'])
+        
+        missed_revenue = unique_missed_orders['CLTV'].sum()
+        orders_affected = unique_missed_orders['ORDER_ID'].nunique()
+        
+        net_profit = cost_savings - missed_revenue
+        
+        # Save the results of this combination
+        results.append({
+            'Model_Threshold': round(thresh, 3),
+            'CLTV_Limit': cltv_limit,
+            'Net_Profit': net_profit,
+            'Cost_Savings': cost_savings,
+            'Missed_Revenue': missed_revenue,
+            'Orders_Cancelled': orders_affected
+        })
+
+# =====================================================================
+# 4. Display the Best Results
+# =====================================================================
+# Convert results to a DataFrame and sort by the highest Net Profit
+results_df = pd.DataFrame(results)
+results_df = results_df.sort_values('Net_Profit', ascending=False).reset_index(drop=True)
+
+print(f"Grid search evaluated {len(probability_thresholds) * len(cltv_thresholds)} combinations in {time.time() - start_time:.2f} seconds.\n")
+
+print("🏆 TOP 10 MOST PROFITABLE COMBINATIONS 🏆")
+print("-" * 80)
+print(results_df.head(10).to_string(index=False))
