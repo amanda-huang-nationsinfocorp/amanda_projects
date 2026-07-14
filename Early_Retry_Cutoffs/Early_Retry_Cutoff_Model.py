@@ -14,6 +14,7 @@ from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 from catboost import CatBoostClassifier
 import os
 import joblib
+from sklearn.frozen import FrozenEstimator
 
 #%%  Fetch Data from Snowflake
 # Start fetching data directly from Snowflake
@@ -36,23 +37,6 @@ cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_DATA 
 # This is drastically faster than pd.read_sql()
 df = cur.fetch_pandas_all()
 
-#%%
-# =====================================================================
-# 4.5 Aggressive Memory Cleanup (Prevent Kernel Crash)
-# =====================================================================
-print("Freeing up RAM before training...")
-import gc
-
-# Delete the massive initial dataframes that are no longer needed
-del df, past_data, train_df, stop_df
-
-# Delete the training and stopping Pandas splits because they are now safely compressed inside the CatBoost Pools!
-del X_train, y_train, X_stop, y_stop
-
-# Force the Python garbage collector to instantly dump them from RAM
-gc.collect()
-
-print("RAM cleared. Ready to train.")
 
 #%% Model Training
 import pandas as pd
@@ -145,13 +129,13 @@ stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=tex
 # =====================================================================
 print("Training Base Model...")
 base_model = CatBoostClassifier(
-    iterations=5000,           
-    learning_rate=0.06,          # Updated Learning Rate
-    depth=5,
+    iterations=2000,           
+    learning_rate=0.1,          # Updated Learning Rate
+    depth=6,
     task_type="CPU",           
     eval_metric='Logloss',
     custom_metric=['AUC'],       
-    l2_leaf_reg=8,
+    l2_leaf_reg=6,
     thread_count=-1,
     early_stopping_rounds=100,  
     verbose=50,
@@ -207,7 +191,10 @@ plt.show()
 # 7. Probability Calibration 
 # =====================================================================
 print("Calibrating Probabilities...")
-calibrated_model = CalibratedClassifierCV(base_model, method='isotonic', cv='prefit')
+calibrated_model = CalibratedClassifierCV(
+    estimator=FrozenEstimator(base_model), 
+    method='isotonic'
+)
 calibrated_model.fit(X_calib, y_calib)
 
 # =====================================================================
@@ -256,6 +243,8 @@ print(f"Model artifact successfully saved to: {model_path}")
 
 #%% Predictions
 
+#%% Predictions
+
 # 1. Load the Model and Metadata
 script_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(script_dir, 'calibrated_catboost_model.joblib')
@@ -271,25 +260,24 @@ drop_cols = artifact['drop_cols']
 
 # 2. Load and Preprocess New Data 
 print("Loading new data...")
-# Replace this with your actual new dataset
-# new_df = pd.read_csv('new_transactions.csv') 
-
-# --- FOR DEMONSTRATION ONLY: Creating a dummy dataframe ---
-new_df = pd.DataFrame() 
-# ----------------------------------------------------------
+# Assuming 'cur' (your database cursor) is already initialized and active in your environment
+cur.execute(("use database dbt_prod"))
+cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025 WHERE TRANSACTION_STATUS != 'accepted' ") 
+df_062025 = cur.fetch_pandas_all()
+df_pred = df_062025.copy()
 
 print("Applying strict preprocessing rules...")
 
 # 1. Format specific string columns if they exist
-if 'DECLINE_CODE' in new_df.columns:
-    new_df['DECLINE_CODE'] = new_df['DECLINE_CODE'].astype(str)
-    new_df['DECLINE_FAMILY'] = new_df['DECLINE_CODE'].str[0]
+if 'DECLINE_CODE' in df_pred.columns:
+    df_pred['DECLINE_CODE'] = df_pred['DECLINE_CODE'].astype(str)
+    df_pred['DECLINE_FAMILY'] = df_pred['DECLINE_CODE'].str[0]
 
-if 'LAST_DECLINE_CODE' in new_df.columns:
-    new_df['LAST_DECLINE_CODE'] = new_df['LAST_DECLINE_CODE'].astype(str)
+if 'LAST_DECLINE_CODE' in df_pred.columns:
+    df_pred['LAST_DECLINE_CODE'] = df_pred['LAST_DECLINE_CODE'].astype(str)
 
 # 2. Drop core IDs and target (ignoring errors if they aren't in the new data)
-X_new = new_df.drop(columns=drop_cols, errors='ignore').copy()
+X_new = df_pred.drop(columns=drop_cols, errors='ignore').copy()
 
 # 3. Apply Imputations based on saved feature lists
 # Categorical/Text Imputation
@@ -302,25 +290,40 @@ numeric_cols = X_new.columns.difference(cat_features + text_features)
 if len(numeric_cols) > 0:
     X_new[numeric_cols] = X_new[numeric_cols].fillna(-1)
 
-# 3. Make Predictions 
+# 3. Make Predictions  
+print("Extracting feature names from the nested model...")
+
+# Dig into the CalibratedClassifierCV
+if hasattr(calibrated_model, 'calibrated_classifiers_'):
+    # Grab the wrapper from the first fold
+    base_wrapper = calibrated_model.calibrated_classifiers_[0].estimator
+else:
+    # Fallback if calibrated without CV somehowv68f59
+    base_wrapper = calibrated_model.estimator
+
+# Dig into your custom FrozenEstimator (Checking common attribute names)
+if hasattr(base_wrapper, 'estimator'):
+    actual_catboost = base_wrapper.estimator
+elif hasattr(base_wrapper, 'model'):
+    actual_catboost = base_wrapper.model
+else:
+    actual_catboost = base_wrapper
+
+# Extract the feature names directly from the underlying CatBoost object
+feature_names = actual_catboost.feature_names_
+
 print("Generating predictions...")
 
 # Ensure column order matches training exactly
-feature_names = calibrated_model.feature_names_in_
 X_new = X_new[feature_names]
 
 # Get the probability of the positive class (IS_EVENTUALLY_SUCCESSFUL = 1)
 probabilities = calibrated_model.predict_proba(X_new)[:, 1]
 
 # Attach probabilities back to the original dataframe
-new_df['SUCCESS_PROBABILITY'] = probabilities
+df_pred['SUCCESS_PROBABILITY'] = probabilities
 
-# Save the results
-# output_path = os.path.join(script_dir, 'predictions_output.csv')
-# new_df.to_csv(output_path, index=False)
-# print(f"Predictions saved to: {output_path}")
-
-print("Done.")
+print("Predictions successfully generated and attached!")
 
 #%% Confusion Matrix
 import numpy as np
@@ -371,17 +374,14 @@ def plot_business_confusion_matrix(y_true, y_probs, threshold=0.05, dataset_name
 
 # =====================================================================
 # Generate the Confusion Matrices using variables from your training script
-# =====================================================================
+# ====================================================================
 
-# 1. Check the Out-Of-Time (OOT) Test Set (Usually the most important for business reality)
-plot_business_confusion_matrix(y_true=y_oot_test, 
-                               y_probs=oot_probs, 
-                               threshold=0.03, 
-                               dataset_name="OOT Test Set (Strict Future)")
+# Check the Random Holdout Test Set
+y_true_062025 = df_pred['IS_EVENTUALLY_SUCCESSFUL'].values
+y_probs_062025 = df_pred['SUCCESS_PROBABILITY'].values
 
-# 2. Check the Random Holdout Test Set
-plot_business_confusion_matrix(y_true=y_random_test, 
-                               y_probs=random_probs, 
+plot_business_confusion_matrix(y_true=y_true_062025, 
+                               y_probs=y_probs_062025, 
                                threshold=0.03, 
                                dataset_name="Random Test Set (In-Sample)")
 
@@ -528,186 +528,97 @@ plt.show()
 #%% ECLTV based cancellation 
 import pandas as pd
 import numpy as np
-import time
 
-# =====================================================================
-# 1. Configuration Settings (Easy to change!)
-# =====================================================================
-THRESHOLD = 0.03
-CLTV_THRESHOLD = 15.0  
-
-# Put the exact partner names you want to evaluate in this list. 
-# If you want to evaluate EVERYONE, just leave the list empty like this: TARGET_PARTNERS = []
-TARGET_PARTNERS = []
-
-# 2. Fetch only the required columns from the CLTV table
-cur = ctx.cursor()
-cur.execute("SELECT ORDER_ID, CLTV_PRED_MEAN FROM DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER") 
-cltv_df = cur.fetch_pandas_all()
-cur.close()
-
-# 3. Bind predictions, actuals, AND CLTV directly into the DataFrame FIRST
-predictions_df = random_test_df.copy() 
-predictions_df['PREDICTED_PROBABILITY'] = random_probs 
-predictions_df['ACTUAL_OUTCOME'] = np.array(y_random_test)
-predictions_df['PREDICTED_OUTCOME'] = (random_probs >= THRESHOLD).astype(int)
-
-# NEW: Merge the CLTV data immediately so we can use it in our decision logic
-# Using a left merge ensures we don't drop rows if a CLTV happens to be missing
-predictions_df = predictions_df.merge(cltv_df, on='ORDER_ID', how='left')
-
-# Fill any completely missing CLTVs with 0 so the model still cuts them off safely
-predictions_df['CLTV_PRED_MEAN'] = predictions_df['CLTV_PRED_MEAN'].fillna(0)
-
-# =====================================================================
-# *** THE NEW BUSINESS RULE ***
-# A transaction is ONLY cancelled if the model predicts 0 AND the CLTV is < 5
-# =====================================================================
-predictions_df['IS_CANCELLED'] = ((predictions_df['PREDICTED_OUTCOME'] == 0) & 
-                                  (predictions_df['CLTV_PRED_MEAN'] < CLTV_THRESHOLD)).astype(int)
-
-
-# 4. Filter by Super Partner 
-if TARGET_PARTNERS:
-    predictions_df = predictions_df[predictions_df['SUPER_PARTNER_ID_NAME'].isin(TARGET_PARTNERS)]
-    partner_label = f"Filtered ({len(TARGET_PARTNERS)} Partners)"
-    print(f"Filtering down to target partners. Rows remaining: {len(predictions_df):,}")
-else:
-    partner_label = "ALL Partners"
-    print(f"Evaluating all partners. Total rows: {len(predictions_df):,}")
-
-
-# =====================================================================
-# 5. Calculate Cost Savings (True Negatives)
-# =====================================================================
-# How many unique orders had at least one retry cancelled?
-cancelled_mask = (predictions_df['IS_CANCELLED'] == 1)
-total_orders_cancelled = predictions_df[cancelled_mask]['ORDER_ID'].nunique()
-
-# A True Negative is now: We ACTUALLY cancelled it, AND the real outcome was 0
-tn_mask = (predictions_df['IS_CANCELLED'] == 1) & (predictions_df['ACTUAL_OUTCOME'] == 0)
-tn_count = tn_mask.sum()
-cost_savings = tn_count * 0.10
-
-# =====================================================================
-# 6. Calculate True Missed Revenue (False Negatives x CLTV)
-# =====================================================================
-# A False Negative is now: We ACTUALLY cancelled it, BUT the real outcome was 1
-fn_mask = (predictions_df['IS_CANCELLED'] == 1) & (predictions_df['ACTUAL_OUTCOME'] == 1)
-
-# Extract unique orders so we only sum the missed CLTV once per affected order
-unique_fn_orders = predictions_df[fn_mask].drop_duplicates(subset=['ORDER_ID'])
-
-total_missed_revenue = unique_fn_orders['CLTV_PRED_MEAN'].sum()
-orders_affected = unique_fn_orders['ORDER_ID'].nunique()
-
-# Calculate final net impact
-net_profit = cost_savings - total_missed_revenue
-
-# Safe division to prevent errors if total_orders_cancelled is 0
-profit_per_cancel = (net_profit / total_orders_cancelled) if total_orders_cancelled > 0 else 0
-
-# =====================================================================
-# 7. Final ROI Output
-# =====================================================================
-print("="*65)
-print(f" 💰 FINAL ROI REPORT (RANDOM TEST SET) 💰")
-print(f" Model Threshold: {THRESHOLD} | CLTV Max Limit: ${CLTV_THRESHOLD}")
-print(f" Segment: {partner_label}")
-print("="*65)
-print(f"Total True Negatives:           {tn_count:,}")
-print(f"Total Retry Cost Saved:        + ${cost_savings:,.2f}")
-print(f"Total Missed Revenue (FN CLTV):- ${total_missed_revenue:,.2f}")
-print("-" * 65)
-if net_profit > 0:
-    print(f"NET FINANCIAL IMPACT:                + ${net_profit:,.2f} (PROFITABLE)")
-    print(f"NET FINANCIAL IMPACT/CANCELATION:    + ${profit_per_cancel:,.6f} (PROFITABLE)")
-else:
-    print(f"NET FINANCIAL IMPACT:                - ${abs(net_profit):,.2f} (LOSS)")
-    print(f"NET FINANCIAL IMPACT/CANCELATION:    - ${abs(profit_per_cancel):,.6f} (LOSS)")
-print("="*65)
-print(f"* We cancelled {total_orders_cancelled:,} unique orders total.")
-print(f"* Missed revenue came from {orders_affected:,} prematurely cancelled orders.")
-
-
-#%% Grid search ecltv 
-import numpy as np
-import pandas as pd
-import time
-
-print("Starting ROI Grid Search Optimization...")
-start_time = time.time()
-
-# =====================================================================
-# 1. Define the ranges you want to test
-# =====================================================================
-# Test probability thresholds from 0.01 to 0.50 in steps of 0.05
-probability_thresholds = np.arange(0.01, 0.50, 0.02) 
-
-# Test these specific CLTV limits
-cltv_thresholds = [1.0, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0]
-
-# =====================================================================
-# 2. Extract raw NumPy arrays for massive speedup in the loop
-# =====================================================================
-probs = predictions_df['PREDICTED_PROBABILITY'].values
-actuals = predictions_df['ACTUAL_OUTCOME'].values
-cltvs = predictions_df['CLTV_PRED_MEAN'].values
-order_ids = predictions_df['ORDER_ID'].values
-
-results = []
-
-# =====================================================================
-# 3. Run the Grid Search
-# =====================================================================
-for thresh in probability_thresholds:
-    # Model predicts failure (0) when probability is LESS than threshold
-    pred_fail = (probs < thresh)
+def evaluate_cutoff_thresholds(df_pred, thresholds_to_test, ecltv_max_threshold=float('inf')):
+    """
+    Calculates the financial impact of cutting off retries based on a probability threshold.
+    Only cuts off orders if their ECLTV_1Y is strictly less than ecltv_max_threshold.
+    """
+    print("Loading data and merging...")
     
-    for cltv_limit in cltv_thresholds:
-        # Business rule allows cancellation (Must be predicted fail AND under CLTV limit)
-        is_cancelled = pred_fail & (cltvs < cltv_limit)
+    # Execute Snowflake query
+    cur = ctx.cursor()
+    cur.execute("SELECT ORDER_ID, CLTV_PRED_MEAN as ECLTV_1Y FROM DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER") 
+    ecltv_df = cur.fetch_pandas_all()
+    
+    # 1. Ensure datetime formatting
+    df_pred['TRANSACTION_DATETIME'] = pd.to_datetime(df_pred['TRANSACTION_DATETIME'])
+    
+    # 2. Merge predictions with the ECLTV dataframe from Snowflake
+    df = pd.merge(df_pred, ecltv_df, on='ORDER_ID', how='left')
+    
+    # Fill missing ECLTV with 0 to prevent math errors
+    df['ECLTV_1Y'] = df['ECLTV_1Y'].fillna(0)
+    
+    # 3. Sort chronologically
+    df = df.sort_values(by=['ORDER_ID', 'TRANSACTION_DATETIME'])
+    
+    # --- Calculate order-level maximums for Gain and Actual Loss ---
+    print("Calculating order-level maximums...")
+    order_stats = df.groupby('ORDER_ID').agg(
+        MAX_RETRY_COUNT=('RETRY_COUNT', 'max'),
+        MAX_HIST_COLLECTED=('HISTORICAL_COLLECTED_AMOUNT', 'max')
+    ).reset_index()
+    
+    # Merge the max stats back into the main dataframe
+    df = pd.merge(df, order_stats, on='ORDER_ID', how='left')
+    results = []
+    
+    print(f"Evaluating thresholds with an ECLTV cap of {ecltv_max_threshold}...")
+    # 4. Iterate over thresholds to generate a comparative report
+    for threshold in thresholds_to_test:
         
-        # Cost Savings (True Negatives)
-        tn_mask = is_cancelled & (actuals == 0)
-        cost_savings = np.sum(tn_mask) * 0.10
+        # --- MODIFIED LOGIC: Filter by BOTH probability and ECLTV ---
+        below_threshold = df[
+            (df['SUCCESS_PROBABILITY'] < threshold) & 
+            (df['ECLTV_1Y'] < ecltv_max_threshold)
+        ]
         
-        # Missed Revenue (False Negatives)
-        fn_mask = is_cancelled & (actuals == 1)
+        # Keep only the FIRST instance for each order
+        first_cutoffs = below_threshold.drop_duplicates(subset=['ORDER_ID'], keep='first').copy()
         
-        # Grab the arrays strictly for the False Negatives
-        fn_order_ids = order_ids[fn_mask]
-        fn_cltvs = cltvs[fn_mask]
+        # 5. Calculate Financial Impacts
         
-        # Put into a quick temp DataFrame to drop duplicate orders
-        # (Ensures we only sum the missed CLTV once per order)
-        temp_df = pd.DataFrame({'ORDER_ID': fn_order_ids, 'CLTV': fn_cltvs})
-        unique_missed_orders = temp_df.drop_duplicates(subset=['ORDER_ID'])
+        # Gain: (max retry count in the order - current retry count) * 0.1
+        first_cutoffs['money_gained'] = (first_cutoffs['MAX_RETRY_COUNT'] - first_cutoffs['RETRY_COUNT']) * 0.1
         
-        missed_revenue = unique_missed_orders['CLTV'].sum()
-        orders_affected = unique_missed_orders['ORDER_ID'].nunique()
+        # Loss Actual: (highest HISTORICAL_COLLECTED_AMOUNT - current transaction HISTORICAL_COLLECTED_AMOUNT)
+        first_cutoffs['loss_actual'] = np.where(
+            first_cutoffs['IS_EVENTUALLY_SUCCESSFUL'] == 1,
+            first_cutoffs['MAX_HIST_COLLECTED'] - first_cutoffs['HISTORICAL_COLLECTED_AMOUNT'],
+            0.0
+        )
         
-        net_profit = cost_savings - missed_revenue
+        # Loss Projected: (ECLTV_1Y - current transaction HISTORICAL_COLLECTED_AMOUNT)
+        first_cutoffs['loss_projected'] = np.where(
+            first_cutoffs['IS_EVENTUALLY_SUCCESSFUL'] == 1,
+            first_cutoffs['ECLTV_1Y'] - first_cutoffs['HISTORICAL_COLLECTED_AMOUNT'],
+            0.0
+        )
         
-        # Save the results of this combination
+        # Calculate Net Actual and Net Projected
+        first_cutoffs['net_actual'] = first_cutoffs['money_gained'] - first_cutoffs['loss_actual']
+        first_cutoffs['net_projected'] = first_cutoffs['money_gained'] - first_cutoffs['loss_projected']
+        
+        # 6. Aggregate results for this threshold
         results.append({
-            'Model_Threshold': round(thresh, 3),
-            'CLTV_Limit': cltv_limit,
-            'Net_Profit': net_profit,
-            'Cost_Savings': cost_savings,
-            'Missed_Revenue': missed_revenue,
-            'Orders_Cancelled': orders_affected
+            'Prob Threshold': threshold,
+            'ECLTV Cap': ecltv_max_threshold,
+            'Orders Cut': len(first_cutoffs),
+            'Total Gain': round(first_cutoffs['money_gained'].sum(), 2),
+            'Loss (Actual)': round(first_cutoffs['loss_actual'].sum(), 2),
+            'Net (Actual)': round(first_cutoffs['net_actual'].sum(), 2),
+            'Loss (Proj)': round(first_cutoffs['loss_projected'].sum(), 2),
+            'Net (Proj)': round(first_cutoffs['net_projected'].sum(), 2)
         })
+        
+    return pd.DataFrame(results)
 
-# =====================================================================
-# 4. Display the Best Results
-# =====================================================================
-# Convert results to a DataFrame and sort by the highest Net Profit
-results_df = pd.DataFrame(results)
-results_df = results_df.sort_values('Net_Profit', ascending=False).reset_index(drop=True)
+# Run the evaluation
+test_thresholds = [0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.15]
 
-print(f"Grid search evaluated {len(probability_thresholds) * len(cltv_thresholds)} combinations in {time.time() - start_time:.2f} seconds.\n")
+# Set your ECLTV limit here (e.g., only cancel orders with ECLTV < 100)
+# If you don't pass this argument, it defaults to infinity (meaning no ECLTV limit).
+impact_report = evaluate_cutoff_thresholds(df_pred, test_thresholds, ecltv_max_threshold=20)
 
-print("🏆 TOP 10 MOST PROFITABLE COMBINATIONS 🏆")
-print("-" * 80)
-print(results_df.head(10).to_string(index=False))
+print(impact_report.to_string(index=False))
