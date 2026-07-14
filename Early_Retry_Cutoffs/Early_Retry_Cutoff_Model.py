@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import json
 import re
+import hashlib                      # CHANGED: stable order-level split assignment
 import snowflake.connector
 from sqlalchemy import create_engine, text
 from snowflake.sqlalchemy import URL
@@ -19,7 +20,6 @@ from sklearn.frozen import FrozenEstimator
 #%%  Fetch Data from Snowflake
 # Start fetching data directly from Snowflake
 ctx = snowflake.connector.connect(
-    
     user='BITEAM',
     password='B1sense@22',
     account='YXBYZCG-MVA06208',
@@ -28,10 +28,11 @@ ctx = snowflake.connector.connect(
     schema='EARLY_RETRY_CUTOFF'
 )
 
+
 # 2. Create a cursor and execute
 cur = ctx.cursor()
 cur.execute(("use database dbt_prod"))
-cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_DATA WHERE TRANSACTION_STATUS != 'accepted' ") 
+cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_DATA")
 
 # 3. Fetch directly to a Pandas DataFrame using Arrow
 # This is drastically faster than pd.read_sql()
@@ -48,32 +49,72 @@ from catboost import CatBoostClassifier, Pool
 
 sampled_df = df
 
+# Must match the DATEDIFF threshold in the training SQL's in-flight filter
+MATURITY_DAYS = 30
+
 # =====================================================================
 # 1. Base Filtering and Sorting
 # =====================================================================
-# Force decline codes to be strings BEFORE attempting string slicing
-sampled_df['DECLINE_CODE'] = sampled_df['DECLINE_CODE'].astype(str)
-sampled_df['DECLINE_FAMILY'] = sampled_df['DECLINE_CODE'].str[0]
+sampled_df['LAST_DECLINE_CODE'] = sampled_df['LAST_DECLINE_CODE'].astype(str)
+sampled_df['DECLINE_FAMILY'] = sampled_df['LAST_DECLINE_CODE'].str[0]
 
-if 'LAST_DECLINE_CODE' in sampled_df.columns:
-    sampled_df['LAST_DECLINE_CODE'] = sampled_df['LAST_DECLINE_CODE'].astype(str)
+sampled_df['TRANSACTION_DATETIME'] = pd.to_datetime(sampled_df['TRANSACTION_DATETIME'])
 
 # Sort ascending to guarantee Past predicts Future
 sampled_df = sampled_df.sort_values('TRANSACTION_DATETIME').reset_index(drop=True)
+
+# =====================================================================
+# 1b. Invoice resolution timing  
+# =====================================================================
+
+print("Computing invoice resolution times...")
+
+invoice_times = sampled_df.groupby('INVOICE_ID', sort=False).agg(
+    INVOICE_START=('TRANSACTION_DATETIME', 'min'),
+    INVOICE_LAST_TXN=('TRANSACTION_DATETIME', 'max'),
+    IS_EVENTUALLY_SUCCESSFUL=('IS_EVENTUALLY_SUCCESSFUL', 'first'),
+)
+
+first_accept = (
+    sampled_df.loc[sampled_df['TRANSACTION_STATUS'] == 'accepted']
+              .groupby('INVOICE_ID')['TRANSACTION_DATETIME'].min()
+)
+
+invoice_times['RESOLVED_AT'] = first_accept.reindex(invoice_times.index).where(
+    invoice_times['IS_EVENTUALLY_SUCCESSFUL'] == 1,
+    invoice_times['INVOICE_START'] + pd.Timedelta(days=MATURITY_DAYS)
+)
+
+if invoice_times['RESOLVED_AT'].isna().any():
+    raise ValueError(
+        f"{invoice_times['RESOLVED_AT'].isna().sum()} invoices are labelled successful "
+        "but have no accepted transaction. Did the != 'accepted' filter get left in the SQL?"
+    )
+
+sampled_df = sampled_df.merge(
+    invoice_times[['INVOICE_START', 'INVOICE_LAST_TXN', 'RESOLVED_AT']],
+    left_on='INVOICE_ID', right_index=True, how='left'
+)
+
+# Now drop the accepted rows -- at serving time the model only ever scores declines.
+sampled_df = sampled_df[sampled_df['TRANSACTION_STATUS'] != 'accepted'].reset_index(drop=True)
+print(f"  {len(sampled_df):,} decline rows | {sampled_df['INVOICE_ID'].nunique():,} invoices "
+      f"| {sampled_df['ORDER_ID'].nunique():,} orders")
 
 # =======================================================================
 # 2. Data Processing & Pre-Split Vectorized I
 # =======================================================================
 print("Processing and Imputing Data...")
-# Drop core IDs and target
-drop_cols = ['ORDER_ID', 'INVOICE_ID', 'TRANSACTION_ID', 'TRANSACTION_DATETIME', 'IS_EVENTUALLY_SUCCESSFUL', 'TRANSACTION_STATUS']
+drop_cols = ['ORDER_ID', 'INVOICE_ID', 'TRANSACTION_ID', 'TRANSACTION_DATETIME',
+             'IS_EVENTUALLY_SUCCESSFUL', 'TRANSACTION_STATUS',
+             'INVOICE_START', 'INVOICE_LAST_TXN', 'RESOLVED_AT']
 
 # Separate text features from standard categorical features for better string processing
 text_features = [col for col in ['SUPER_PARTNER_ID_NAME', 'BANK'] if col in sampled_df.columns]
 
 # Get remaining categorical features (Using errors='ignore' safely)
 cat_features = sampled_df.drop(columns=drop_cols, errors='ignore').select_dtypes(include=['object', 'category']).columns.tolist()
-cat_features = [c for c in cat_features if c not in text_features] 
+cat_features = [c for c in cat_features if c not in text_features]
 
 # Vectorized Imputation BEFORE the split (Massive speedup)
 sampled_df[cat_features + text_features] = sampled_df[cat_features + text_features].fillna('unknown').astype(str)
@@ -83,31 +124,74 @@ numeric_cols = sampled_df.columns.difference(cat_features + text_features + drop
 sampled_df[numeric_cols] = sampled_df[numeric_cols].fillna(-1)
 
 # =====================================================================
-# 3. Hybrid Split (Chronological OOT + Random In-Sample)y
+# 3. Hybrid Split (As-Of-Date OOT + Order-Grouped Random)
 # =====================================================================
-print("Splitting data (Hybrid OOT + Random)...")
+print("Splitting data (As-Of OOT + Order-Grouped Random)...")
 
-# 1. Slice off the strict future for the OOT Test Set (Last 10%)
-n = len(sampled_df)
-oot_start = int(n * 0.90)
+ASOF_DATE = pd.Timestamp('2026-01-15')   # "retrain the model on this date"
+OOT_END   = pd.Timestamp('2026-03-01')   # MUST be <= max ORDER_DATE in the extract
 
-past_data = sampled_df.iloc[:oot_start].copy()
-oot_test_df = sampled_df.iloc[oot_start:].copy()
+invoice_elig = sampled_df.groupby('INVOICE_ID', sort=False).agg(
+    RESOLVED_AT=('RESOLVED_AT', 'first'),
+    INVOICE_LAST_TXN=('INVOICE_LAST_TXN', 'first'),
+)
+eligible_invoices = invoice_elig.index[
+    (invoice_elig['RESOLVED_AT'] < ASOF_DATE) &
+    (invoice_elig['INVOICE_LAST_TXN'] < ASOF_DATE)
+]
 
-# 2. Randomly shuffle the past data to destroy time-order
-print("Shuffling past data for random splits...")
-past_data = past_data.sample(frac=1, random_state=42).reset_index(drop=True)
+past_data = sampled_df[
+    sampled_df['INVOICE_ID'].isin(eligible_invoices) &
+    (sampled_df['TRANSACTION_DATETIME'] < ASOF_DATE)
+].copy()
 
-# 3. Split the randomized past data
-m = len(past_data)
-train_end = int(m * 0.75)  
-stop_end  = int(m * 0.85)  
-calib_end = int(m * 0.95)  
+oot_test_df = sampled_df[
+    (sampled_df['TRANSACTION_DATETIME'] >= ASOF_DATE) &
+    (sampled_df['TRANSACTION_DATETIME'] < OOT_END)
+].copy()
 
-train_df       = past_data.iloc[:train_end]
-stop_df        = past_data.iloc[train_end:stop_end]
-calib_df       = past_data.iloc[stop_end:calib_end]
-random_test_df = past_data.iloc[calib_end:]
+assert not (set(past_data['INVOICE_ID']) & set(oot_test_df['INVOICE_ID'])), \
+    "invoices straddle the as-of boundary"
+
+print(f"  past_data   : {len(past_data):>9,} rows | {past_data['ORDER_ID'].nunique():>7,} orders")
+print(f"  oot_test_df : {len(oot_test_df):>9,} rows | {oot_test_df['ORDER_ID'].nunique():>7,} orders")
+print(f"  orders in both (new invoices, expected): "
+      f"{len(set(past_data['ORDER_ID']) & set(oot_test_df['ORDER_ID'])):,}")
+print(f"  dropped (unresolved at ASOF / beyond OOT_END): "
+      f"{len(sampled_df) - len(past_data) - len(oot_test_df):,} rows")
+
+# --- FIX 1: order-grouped assignment --------------------------------------------
+# hashlib rather than hash(): Python salts str hashing per process, so hash() would
+# reshuffle orders across splits on every run. This assignment is stable, and stays
+# stable when new orders are added next month.
+def order_hash_frac(order_ids, salt='retry_cutoff_v1'):
+    return np.array([
+        int(hashlib.md5(f'{salt}:{o}'.encode()).hexdigest()[:16], 16) / 2**64
+        for o in order_ids
+    ])
+
+unique_orders = past_data['ORDER_ID'].unique()
+order_frac = pd.Series(order_hash_frac(unique_orders), index=unique_orders)
+row_frac = past_data['ORDER_ID'].map(order_frac)
+
+# Same 75 / 10 / 10 / 5 boundaries as before -- but over ORDERS, not rows.
+train_df       = past_data[row_frac < 0.75].copy()
+stop_df        = past_data[(row_frac >= 0.75) & (row_frac < 0.85)].copy()
+calib_df       = past_data[(row_frac >= 0.85) & (row_frac < 0.95)].copy()
+random_test_df = past_data[row_frac >= 0.95].copy()
+
+for _name, _part in [('train_df', train_df), ('stop_df', stop_df),
+                     ('calib_df', calib_df), ('random_test_df', random_test_df)]:
+    print(f"  {_name:<15}: {len(_part):>9,} rows | {_part['ORDER_ID'].nunique():>7,} orders "
+          f"| base rate {_part['IS_EVENTUALLY_SUCCESSFUL'].mean():.4f}")
+
+for _a, _b in [('train_df', train_df), ('stop_df', stop_df),
+               ('calib_df', calib_df), ('random_test_df', random_test_df)]:
+    for _c, _d in [('train_df', train_df), ('stop_df', stop_df),
+                   ('calib_df', calib_df), ('random_test_df', random_test_df)]:
+        if _a < _c:
+            assert not (set(_b['ORDER_ID']) & set(_d['ORDER_ID'])), f"{_a}/{_c} share orders"
+print("  [ok] no ORDER_ID spans two splits")
 
 # 4. Separate X and y (Using errors='ignore' safely)
 X_train, y_train = train_df.drop(columns=drop_cols, errors='ignore'), train_df['IS_EVENTUALLY_SUCCESSFUL']
@@ -118,33 +202,33 @@ X_random_test, y_random_test = random_test_df.drop(columns=drop_cols, errors='ig
 X_oot_test,    y_oot_test    = oot_test_df.drop(columns=drop_cols, errors='ignore'),    oot_test_df['IS_EVENTUALLY_SUCCESSFUL']
 
 # =====================================================================
-# 4. Create Memory-Efficient CatBoost Pools 
+# 4. Create Memory-Efficient CatBoost Pools
 # =====================================================================
 print("Building data pools...")
 train_pool = Pool(X_train, y_train, cat_features=cat_features, text_features=text_features)
 stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=text_features)
 
 # =====================================================================
-# 5. Base Model Definition 
+# 5. Base Model Definition
 # =====================================================================
 print("Training Base Model...")
 base_model = CatBoostClassifier(
-    iterations=2000,           
+    iterations=2000,
     learning_rate=0.1,          # Updated Learning Rate
     depth=6,
-    task_type="CPU",           
+    task_type="CPU",
     eval_metric='Logloss',
-    custom_metric=['AUC'],       
+    custom_metric=['AUC'],
     l2_leaf_reg=6,
     thread_count=-1,
-    early_stopping_rounds=100,  
+    early_stopping_rounds=100,
     verbose=50,
     random_state=42,
     cat_features=cat_features,
-    text_features=text_features  
+    text_features=text_features
 )
 
-# Train the model, strictly using the Stop pool 
+# Train the model, strictly using the Stop pool
 base_model.fit(train_pool, eval_set=stop_pool)
 
 # =====================================================================
@@ -188,11 +272,11 @@ plt.tight_layout()
 plt.show()
 
 # =====================================================================
-# 7. Probability Calibration 
+# 7. Probability Calibration
 # =====================================================================
 print("Calibrating Probabilities...")
 calibrated_model = CalibratedClassifierCV(
-    estimator=FrozenEstimator(base_model), 
+    estimator=FrozenEstimator(base_model),
     method='isotonic'
 )
 calibrated_model.fit(X_calib, y_calib)
@@ -211,16 +295,20 @@ def evaluate_split(split_name, model, X, y):
     return y_prob
 
 print("--- Model Performance Summary ---")
-# 1. How well does it generalize to unseen data from the SAME time period?
+# 1. Unseen ORDERS from the same period as training -> generalization to new customers.
 random_probs = evaluate_split("Random Test", calibrated_model, X_random_test, y_random_test)
 
-# 2. How well does it generalize to the STRICT FUTURE (Immaturity/Temporal Drift)?
+# 2. The strict future -> what the model would actually have scored after ASOF_DATE.
 oot_probs    = evaluate_split("OOT Test", calibrated_model, X_oot_test, y_oot_test)
 
 # Calculate the Degradation Penalty
 auc_drop = roc_auc_score(y_random_test, random_probs) - roc_auc_score(y_oot_test, oot_probs)
 print(f"\nTemporal Degradation Penalty (AUC Drop): {auc_drop:.4f}")
-print("*(If this drop is large, the recent data is highly 'immature' or behavior shifted over time)*")
+# CHANGED: both sides are now order-grouped and label-mature, so this gap is no longer
+# contaminated by row duplication or by lifecycle-tail enrichment. What remains is
+# genuine drift between the training period and the deployment window.
+print("*(Both splits are order-grouped and label-mature. A large drop now means real")
+print("  behavioural/processor drift between the training period and OOT window.)*")
 
 
 #%% Save Model
@@ -233,15 +321,15 @@ model_artifact = {
     'model': calibrated_model,
     'cat_features': cat_features,
     'text_features': text_features,
-    'drop_cols': drop_cols
+    'drop_cols': drop_cols,
+    'asof_date': ASOF_DATE,      # CHANGED: what the model knew, and when
+    'oot_end': OOT_END,
 }
 
 # 3. Save the artifact to the script's directory
 joblib.dump(model_artifact, model_path)
 
 print(f"Model artifact successfully saved to: {model_path}")
-
-#%% Predictions
 
 #%% Predictions
 
@@ -258,23 +346,23 @@ cat_features = artifact['cat_features']
 text_features = artifact['text_features']
 drop_cols = artifact['drop_cols']
 
-# 2. Load and Preprocess New Data 
+# 2. Load and Preprocess New Data
 print("Loading new data...")
 # Assuming 'cur' (your database cursor) is already initialized and active in your environment
 cur.execute(("use database dbt_prod"))
-cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025 WHERE TRANSACTION_STATUS != 'accepted' ") 
+cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025 WHERE TRANSACTION_STATUS != 'accepted' ")
 df_062025 = cur.fetch_pandas_all()
 df_pred = df_062025.copy()
 
 print("Applying strict preprocessing rules...")
 
 # 1. Format specific string columns if they exist
-if 'DECLINE_CODE' in df_pred.columns:
-    df_pred['DECLINE_CODE'] = df_pred['DECLINE_CODE'].astype(str)
-    df_pred['DECLINE_FAMILY'] = df_pred['DECLINE_CODE'].str[0]
-
+# CHANGED: mirrors section 1 -- DECLINE_FAMILY comes from LAST_DECLINE_CODE now.
+# Without this the model's DECLINE_FAMILY column is missing and the reindex below
+# raises a KeyError.
 if 'LAST_DECLINE_CODE' in df_pred.columns:
     df_pred['LAST_DECLINE_CODE'] = df_pred['LAST_DECLINE_CODE'].astype(str)
+    df_pred['DECLINE_FAMILY'] = df_pred['LAST_DECLINE_CODE'].str[0]
 
 # 2. Drop core IDs and target (ignoring errors if they aren't in the new data)
 X_new = df_pred.drop(columns=drop_cols, errors='ignore').copy()
@@ -290,7 +378,7 @@ numeric_cols = X_new.columns.difference(cat_features + text_features)
 if len(numeric_cols) > 0:
     X_new[numeric_cols] = X_new[numeric_cols].fillna(-1)
 
-# 3. Make Predictions  
+# 3. Make Predictions
 print("Extracting feature names from the nested model...")
 
 # Dig into the CalibratedClassifierCV
@@ -298,7 +386,7 @@ if hasattr(calibrated_model, 'calibrated_classifiers_'):
     # Grab the wrapper from the first fold
     base_wrapper = calibrated_model.calibrated_classifiers_[0].estimator
 else:
-    # Fallback if calibrated without CV somehowv68f59
+    # Fallback if calibrated without CV somehow
     base_wrapper = calibrated_model.estimator
 
 # Dig into your custom FrozenEstimator (Checking common attribute names)
@@ -324,6 +412,7 @@ probabilities = calibrated_model.predict_proba(X_new)[:, 1]
 df_pred['SUCCESS_PROBABILITY'] = probabilities
 
 print("Predictions successfully generated and attached!")
+
 
 #%% Confusion Matrix
 import numpy as np
