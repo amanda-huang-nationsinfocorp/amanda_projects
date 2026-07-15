@@ -97,8 +97,8 @@ sampled_df = sampled_df.merge(
 )
 
 # Now drop the accepted rows -- at serving time the model only ever scores declines.
-sampled_df = sampled_df[sampled_df['TRANSACTION_STATUS'] != 'accepted'].reset_index(drop=True)
-print(f"  {len(sampled_df):,} decline rows | {sampled_df['INVOICE_ID'].nunique():,} invoices "
+#sampled_df = sampled_df[sampled_df['TRANSACTION_STATUS'] != 'accepted'].reset_index(drop=True)
+print(f"  {len(sampled_df):,} rows | {sampled_df['INVOICE_ID'].nunique():,} invoices "
       f"| {sampled_df['ORDER_ID'].nunique():,} orders")
 
 # =======================================================================
