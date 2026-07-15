@@ -471,7 +471,7 @@ y_probs_062025 = df_pred['SUCCESS_PROBABILITY'].values
 
 plot_business_confusion_matrix(y_true=y_true_062025, 
                                y_probs=y_probs_062025, 
-                               threshold=0.03, 
+                               threshold=0.05, 
                                dataset_name="Random Test Set (In-Sample)")
 
 
@@ -627,7 +627,27 @@ def evaluate_cutoff_thresholds(df_pred, thresholds_to_test, ecltv_max_threshold=
     
     # Execute Snowflake query
     cur = ctx.cursor()
-    cur.execute("SELECT ORDER_ID, CLTV_PRED_MEAN as ECLTV_1Y FROM DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER") 
+    cur.execute("""
+    with ecltv as (
+    SELECT ORDER_ID, CLTV_PRED_MEAN as ECLTV_1Y FROM DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER
+    ),
+
+    tb as (select
+    order_id,
+    div0(sum(case when is_sale = 1 and is_daydiff_interval_txn_order_0360 then transaction_amount else 0 end),
+        count (distinct case when is_m0 = 1 and is_daydiff_interval_txn_order_0360 then order_id else null end)) as cltv_360,
+    max(ECLTV_1Y) as ecltv_1y
+    FROM DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+    left join ecltv using (order_id)
+    where order_date >= '2025-06-01' and order_date < '2025-07-01'
+    and is_m0 = 1
+    group by 1
+    )
+
+    select 
+    *
+    from tb
+    """) 
     ecltv_df = cur.fetch_pandas_all()
     
     # 1. Ensure datetime formatting
@@ -638,6 +658,7 @@ def evaluate_cutoff_thresholds(df_pred, thresholds_to_test, ecltv_max_threshold=
     
     # Fill missing ECLTV with 0 to prevent math errors
     df['ECLTV_1Y'] = df['ECLTV_1Y'].fillna(0)
+    df['CLTV_360'] = df['CLTV_360'].fillna(0)
     
     # 3. Sort chronologically
     df = df.sort_values(by=['ORDER_ID', 'TRANSACTION_DATETIME'])
@@ -645,8 +666,7 @@ def evaluate_cutoff_thresholds(df_pred, thresholds_to_test, ecltv_max_threshold=
     # --- Calculate order-level maximums for Gain and Actual Loss ---
     print("Calculating order-level maximums...")
     order_stats = df.groupby('ORDER_ID').agg(
-        MAX_RETRY_COUNT=('RETRY_COUNT', 'max'),
-        MAX_HIST_COLLECTED=('HISTORICAL_COLLECTED_AMOUNT', 'max')
+        MAX_RETRY_COUNT=('RETRIES', 'max')
     ).reset_index()
     
     # Merge the max stats back into the main dataframe
@@ -669,12 +689,12 @@ def evaluate_cutoff_thresholds(df_pred, thresholds_to_test, ecltv_max_threshold=
         # 5. Calculate Financial Impacts
         
         # Gain: (max retry count in the order - current retry count) * 0.1
-        first_cutoffs['money_gained'] = (first_cutoffs['MAX_RETRY_COUNT'] - first_cutoffs['RETRY_COUNT']) * 0.1
+        first_cutoffs['money_gained'] = (first_cutoffs['MAX_RETRY_COUNT'] - first_cutoffs['RETRIES']) * 0.1
         
-        # Loss Actual: (highest HISTORICAL_COLLECTED_AMOUNT - current transaction HISTORICAL_COLLECTED_AMOUNT)
+        # Loss Actual: (actual collections over 360 days - current transaction HISTORICAL_COLLECTED_AMOUNT)
         first_cutoffs['loss_actual'] = np.where(
             first_cutoffs['IS_EVENTUALLY_SUCCESSFUL'] == 1,
-            first_cutoffs['MAX_HIST_COLLECTED'] - first_cutoffs['HISTORICAL_COLLECTED_AMOUNT'],
+            first_cutoffs['CLTV_360'] - first_cutoffs['HISTORICAL_COLLECTED_AMOUNT'],
             0.0
         )
         
@@ -711,3 +731,72 @@ test_thresholds = [0.01, 0.02, 0.03, 0.04, 0.05, 0.10, 0.15]
 impact_report = evaluate_cutoff_thresholds(df_pred, test_thresholds, ecltv_max_threshold=20)
 
 print(impact_report.to_string(index=False))
+
+#%% Top 50 orders driving Net(Actual) vs Net(Proj) divergence (threshold < 0.10)
+
+def top_divergent_orders(df_pred, prob_threshold=0.10, ecltv_max_threshold=20, top_n=50):
+    """
+    Returns the orders whose CLTV_360 (actual) most differs from ECLTV_1Y (projected)
+    among first-cutoffs below prob_threshold. Since money_gained and
+    HISTORICAL_COLLECTED_AMOUNT cancel between net_actual and net_projected,
+    the per-order divergence reduces to (ECLTV_1Y - CLTV_360), nonzero only when
+    the order is eventually successful.
+    """
+    print("Loading data and merging...")
+
+    # Same ECLTV / CLTV_360 pull as evaluate_cutoff_thresholds
+    cur = ctx.cursor()
+    cur.execute("""
+    with ecltv as (
+    SELECT ORDER_ID, CLTV_PRED_MEAN as ECLTV_1Y FROM DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER
+    ),
+
+    tb as (select
+    order_id,
+    div0(sum(case when is_sale = 1 and is_daydiff_interval_txn_order_0360 then transaction_amount else 0 end),
+        count (distinct case when is_m0 = 1 and is_daydiff_interval_txn_order_0360 then order_id else null end)) as cltv_360,
+    max(ECLTV_1Y) as ecltv_1y
+    FROM DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+    left join ecltv using (order_id)
+    where order_date >= '2025-06-01' and order_date < '2025-07-01'
+    and is_m0 = 1
+    group by 1
+    )
+
+    select
+    *
+    from tb
+    """)
+    ecltv_df = cur.fetch_pandas_all()
+
+    df_pred['TRANSACTION_DATETIME'] = pd.to_datetime(df_pred['TRANSACTION_DATETIME'])
+    df = pd.merge(df_pred, ecltv_df, on='ORDER_ID', how='left')
+    df['ECLTV_1Y'] = df['ECLTV_1Y'].fillna(0)
+    df['CLTV_360'] = df['CLTV_360'].fillna(0)
+    df = df.sort_values(by=['ORDER_ID', 'TRANSACTION_DATETIME'])
+
+    # First cutoff per order below the probability threshold (ECLTV cap applied to match the report)
+    below_threshold = df[
+        (df['SUCCESS_PROBABILITY'] < prob_threshold) &
+        (df['ECLTV_1Y'] < ecltv_max_threshold)
+    ]
+    first_cutoffs = below_threshold.drop_duplicates(subset=['ORDER_ID'], keep='first').copy()
+
+    # Per-order contribution to Net(Actual) - Net(Proj); only successful orders carry loss
+    first_cutoffs['net_actual_minus_proj'] = np.where(
+        first_cutoffs['IS_EVENTUALLY_SUCCESSFUL'] == 1,
+        first_cutoffs['ECLTV_1Y'] - first_cutoffs['CLTV_360'],
+        0.0
+    )
+    first_cutoffs['ABS_DIFF'] = first_cutoffs['net_actual_minus_proj'].abs()
+
+    cols = ['ORDER_ID', 'SUCCESS_PROBABILITY', 'IS_EVENTUALLY_SUCCESSFUL',
+            'HISTORICAL_COLLECTED_AMOUNT', 'CLTV_360', 'ECLTV_1Y',
+            'net_actual_minus_proj', 'ABS_DIFF']
+    return (first_cutoffs.sort_values('ABS_DIFF', ascending=False)
+                         .head(top_n)[cols]
+                         .reset_index(drop=True))
+
+top50 = top_divergent_orders(df_pred, prob_threshold=0.10, ecltv_max_threshold=20, top_n=50)
+print(top50.to_string(index=False))
+# %%
