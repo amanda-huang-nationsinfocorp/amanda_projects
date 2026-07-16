@@ -821,6 +821,8 @@ def top_divergent_orders(df_pred, prob_threshold=0.10, ecltv_max_threshold=20, t
 
 top50 = top_divergent_orders(df_pred, prob_threshold=0.10, ecltv_max_threshold=20, top_n=50)
 print(top50.to_string(index=False))
+
+
 #%% ECLTV based cancellation
 import pandas as pd
 import numpy as np
@@ -866,6 +868,7 @@ def prepare_cutoff_frame(df_pred):
     # never collected and never will. Real zeros, not missing data -- and the cheapest
     # orders to cut. Keep them.
     never_m0 = df['_src'] == 'left_only'
+    df['NEVER_M0'] = never_m0            # persist for downstream diagnostics
     df.loc[never_m0, ['CLTV_360', 'ECLTV_1Y']] = 0.0
     df = df.drop(columns='_src')
 
@@ -888,7 +891,9 @@ def prepare_cutoff_frame(df_pred):
     # Cutting off cancels the order, so every remaining attempt across all of its
     # invoices is saved. Decision is pre-attempt, so the current row counts too.
     df['ORDER_ATTEMPTS_SAVED'] = (df.groupby('ORDER_ID')['TRANSACTION_ID'].transform('size')
-                                  - df.groupby('ORDER_ID').cumcount())
+                                  - df.groupby('ORDER_ID').cumcount())+5
+    rev = df.iloc[::-1]
+    df['FUTURE_SUCCESS'] = rev.groupby('ORDER_ID')['IS_EVENTUALLY_SUCCESSFUL'].cummax().iloc[::-1]
     return df
 
 
@@ -899,13 +904,26 @@ def _score(cut, label):
     # clip(0): CLTV_360 below already-collected means the two windows count different
     # things, not that cancelling earned us money.
     cut['loss_actual'] = (cut['CLTV_360'] - cut['HISTORICAL_COLLECTED_AMOUNT']).clip(lower=0)
+
+    # ECLTV_1Y is a signup-time forecast that never learned the order died, so it stays
+    # positive for true negatives and invents losses on customers who never pay. Charge
+    # the projection only where an invoice at/after the cut would actually have collected.
+    cut['loss_proj'] = np.where(
+        cut['FUTURE_SUCCESS'] == 1,
+        (cut['ECLTV_1Y'] - cut['HISTORICAL_COLLECTED_AMOUNT']).clip(lower=0),
+        0.0)
+
     return {
         'Rule': label,
         'Orders Cut': len(cut),
+        'False Negatives': int((cut['FUTURE_SUCCESS'] == 1).sum()),
+        'FN Rate': f"{(cut['FUTURE_SUCCESS'] == 1).mean():.1%}",
         'Free Cuts (no CLTV)': int((cut['CLTV_360'] == 0).sum()),
         'Total Gain': round(cut['money_gained'].sum(), 2),
         'Loss (Actual)': round(cut['loss_actual'].sum(), 2),
         'Net (Actual)': round((cut['money_gained'] - cut['loss_actual']).sum(), 2),
+        'Loss (Proj)': round(cut['loss_proj'].sum(), 2),
+        'Net (Proj)': round((cut['money_gained'] - cut['loss_proj']).sum(), 2),
     }
 
 
@@ -937,6 +955,7 @@ _diff = _ungated.values != _gated
 print(f"\nGate check @0.05: {_diff.sum():,}/{len(_c):,} orders differ, "
       f"${_ungated[_diff].sum():,.0f} at stake. Zero => a failed invoice really does end "
       f"the order, and the gate is redundant.")
+
 
 
 #%%
@@ -1098,190 +1117,121 @@ print("  Multi-invoice orders diverge because retry numbers restart at 0 each in
 print("  so 'max retry - current retry' cannot see the invoices cancelling also kills.")
 
 #%%
-#%% Why does dropping the success gate cost $146k?
-# Three candidates. This tells you which.
-#   A: orders genuinely collect after a failed invoice   -> gate is wrong, loss is real
-#   B: labels are wrong (accepted txn hidden by filters) -> loss real AND target corrupted
-#   C: CLTV_360 counts money HIST cannot see             -> loss is phantom, gate masked it
+#%% False negatives + never-M0 investigation
+# Add FUTURE_SUCCESS inside prepare_cutoff_frame, right after ORDER_ATTEMPTS_SAVED:
+#
+#     rev = df.iloc[::-1]
+#     df['FUTURE_SUCCESS'] = rev.groupby('ORDER_ID')['IS_EVENTUALLY_SUCCESSFUL'].cummax().iloc[::-1]
+#
+# Cutting kills the whole order, so every invoice at or after this row dies with it.
+# If any of them would have collected, the order was cut prematurely => false negative.
+#
+# And in _score, after 'Orders Cut':
+#
+#     'False Negatives': int((cut['FUTURE_SUCCESS'] == 1).sum()),
+#     'FN Rate': f"{(cut['FUTURE_SUCCESS'] == 1).mean():.1%}",
 
 import pandas as pd
 import numpy as np
 
 # =============================================================================
-# TEST 1 -- how much collected money do the extract's filters hide?
-# base_transactions requires retries IS NOT NULL AND transaction_type IN
-# ('sale','capture'). Anything accepted outside that is invisible to
-# HISTORICAL_COLLECTED_AMOUNT *and* to MAX(accepted) -- i.e. to the label.
+# Which never-M0 orders collected money, and why?
 # =============================================================================
-cur = ctx.cursor()
-cur.execute("""
-select
-    case when retries is null then 'retries IS NULL'
-         when transaction_type not in ('sale','capture') then 'other transaction_type'
-         else 'visible to extract' end          as bucket,
-    transaction_type,
-    count(*)                                     as txns,
-    sum(iff(transaction_status='accepted',1,0))  as accepted_txns,
-    round(sum(iff(transaction_status='accepted', transaction_amount, 0)), 2) as accepted_dollars
-from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
-where order_date >= '2025-06-01' and order_date < '2025-07-01'
-group by 1, 2
-order by accepted_dollars desc
-""")
-hidden = cur.fetch_pandas_all()
-print("=" * 84)
-print("TEST 1 -- collected money the extract cannot see")
-print("=" * 84)
-print(hidden.to_string(index=False))
-vis = hidden.loc[hidden.BUCKET == 'visible to extract', 'ACCEPTED_DOLLARS'].sum()
-inv = hidden.loc[hidden.BUCKET != 'visible to extract', 'ACCEPTED_DOLLARS'].sum()
-print(f"\n  visible ${vis:,.0f} | INVISIBLE ${inv:,.0f} ({inv/(vis+inv):.1%} of all collections)")
-print("  Any invisible dollars => CLTV_360 sees them, HIST does not, and MAX(accepted)")
-print("  misses them too. That is hypothesis B/C, and it breaks the label as well.")
+never = cutoff_df[cutoff_df['NEVER_M0']]
+# > 1, not > 0: the +1 offset in prepare_cutoff_frame makes a true $0 order read $1.
+collected = (never.groupby('ORDER_ID')['HISTORICAL_COLLECTED_AMOUNT'].max()
+                  .loc[lambda s: s > 1].sort_values(ascending=False))
+
+n_never = never['ORDER_ID'].nunique()
+print("=" * 78)
+print("NEVER-M0 ORDERS THAT COLLECTED MONEY")
+print("=" * 78)
+print(f"  never-M0 orders          : {n_never:,}")
+print(f"  ...that collected > $0   : {len(collected):,} ({len(collected)/n_never:.2%})")
+print(f"  total collected by them  : ${collected.sum():,.2f}")
+print(f"\n  Every one of these is being cut with loss forced to $0.\n")
+print(collected.head(20).to_string())
 
 # =============================================================================
-# TEST 2 -- per order: does CLTV_360 exceed everything the extract shows collected?
-# If yes for nearly every order, the gap is an accounting artifact, not revenue.
+# THE DECIDER -- are they really non-M0, or did the June date filter drop them?
+#
+# load_cltv() filters `order_date >= '2025-06-01' and order_date < '2025-07-01'`.
+# An order that DID make M0 but whose order_date falls outside June is ALSO absent
+# from tb -- and my merge indicator marks it 'left_only' exactly like a true non-M0
+# order. NEVER_M0 conflates the two. If is_m0=1 comes back below, that is the bug.
 # =============================================================================
-extract_collected = (df_pred[df_pred['TRANSACTION_STATUS'] == 'accepted']
-                     .groupby('ORDER_ID')['TRANSACTION_AMOUNT'].sum().rename('EXTRACT_COLLECTED'))
-
-cmp = (load_cltv(dedupe=True).set_index('ORDER_ID')
-       .join(extract_collected, how='inner'))
-cmp['GAP'] = cmp['CLTV_360'] - cmp['EXTRACT_COLLECTED']
-
-print("\n" + "=" * 84)
-print("TEST 2 -- CLTV_360 minus what the extract says was collected, per order")
-print("=" * 84)
-print(cmp['GAP'].describe().round(2).to_string())
-print(f"\n  orders with GAP > $0.01 : {(cmp['GAP'] > 0.01).mean():.1%}")
-print(f"  median GAP              : ${cmp['GAP'].median():.2f}")
-print(f"  GAP == a tight cluster? -> a fixed per-order charge the extract drops (the M0 trial)")
-print("\n  GAP distribution:")
-print(cmp['GAP'].round(0).value_counts().head(8).to_string())
-
-# =============================================================================
-# TEST 3 -- THE DECIDER. For the orders driving the $146k, is there actually an
-# accepted transaction after the cutoff point, in the extract itself?
-#   found => hypothesis A (real revenue after a failed invoice)
-#   none  => hypothesis B/C (the money is only in CLTV_360, not in your data)
-# =============================================================================
-base = build(df_pred, load_cltv(dedupe=True))
-base.loc[base['NEVER_M0'], ['CLTV_360', 'ECLTV_1Y']] = 0.0
-
-cut = (base[(base['SUCCESS_PROBABILITY'] < 0.05) & (base['ECLTV_1Y'] < 20)]
-       .drop_duplicates('ORDER_ID', keep='first').copy())
-cut['loss'] = (cut['CLTV_360'] - cut['HISTORICAL_COLLECTED_AMOUNT']).clip(lower=0)
-
-# the population the gate was hiding
-hidden_loss = cut[(cut['IS_EVENTUALLY_SUCCESSFUL'] == 0) & (cut['loss'] > 0)]
-print("\n" + "=" * 84)
-print("TEST 3 -- the orders the gate was suppressing")
-print("=" * 84)
-print(f"  orders: {len(hidden_loss):,}   loss they carry: ${hidden_loss['loss'].sum():,.0f}")
-
-# for each, is there an accepted txn in the extract after the cutoff datetime?
-cutoff_at = hidden_loss.set_index('ORDER_ID')['TRANSACTION_DATETIME']
-acc = df_pred[df_pred['TRANSACTION_STATUS'] == 'accepted'][['ORDER_ID', 'TRANSACTION_DATETIME', 'TRANSACTION_AMOUNT']]
-acc = acc[acc['ORDER_ID'].isin(cutoff_at.index)].copy()
-acc['CUTOFF_AT'] = acc['ORDER_ID'].map(cutoff_at)
-after = acc[pd.to_datetime(acc['TRANSACTION_DATETIME']) > pd.to_datetime(acc['CUTOFF_AT'])]
-
-n_with_real = after['ORDER_ID'].nunique()
-print(f"  ...of which have a REAL accepted txn after the cutoff : {n_with_real:,} "
-      f"({n_with_real/max(len(hidden_loss),1):.1%})")
-print(f"  ...dollars actually collected after the cutoff        : ${after['TRANSACTION_AMOUNT'].sum():,.0f}")
-print(f"  ...dollars CLTV_360 claims were lost                  : ${hidden_loss['loss'].sum():,.0f}")
-
-ratio = after['TRANSACTION_AMOUNT'].sum() / max(hidden_loss['loss'].sum(), 1e-9)
-print(f"\n  RATIO real/claimed = {ratio:.1%}")
-print("    ~100% -> HYPOTHESIS A. Orders do survive failed invoices. Your gate is wrong,")
-print("             the loss is real, and cutting at 0.05 destroys value.")
-print("    ~0%   -> HYPOTHESIS B/C. The money exists only in CLTV_360, not in your")
-print("             transactions. The loss is an accounting artifact -- and the same")
-print("             filters that hide it also corrupt IS_EVENTUALLY_SUCCESSFUL.")
-
-# =============================================================================
-# TEST 4 -- if B: how many invoices are labelled failed but actually collected?
-# =============================================================================
-cur.execute("""
-with filtered as (
-    select invoice_id, max(iff(transaction_status='accepted',1,0)) as lbl
+if len(collected):
+    ids = ','.join(str(i) for i in collected.head(50).index)
+    cur = ctx.cursor()
+    cur.execute(f"""
+    select order_id,
+           max(is_m0)                                   as is_m0,
+           min(order_date)                              as order_date,
+           count(*)                                     as txns,
+           sum(iff(transaction_status='accepted',1,0))  as accepted_txns,
+           round(sum(iff(transaction_status='accepted', transaction_amount, 0)),2) as collected
     from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
-    where retries is not null and transaction_type in ('sale','capture')
-      and order_date >= '2025-06-01' and order_date < '2025-07-01'
+    where order_id in ({ids})
     group by 1
-),
-truth as (
-    select invoice_id, max(iff(transaction_status='accepted',1,0)) as lbl
-    from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
-    where order_date >= '2025-06-01' and order_date < '2025-07-01'
-    group by 1
-)
-select count(*) as invoices,
-       sum(iff(f.lbl=0 and t.lbl=1,1,0)) as labelled_fail_but_paid,
-       round(100*avg(iff(f.lbl=0 and t.lbl=1,1,0)), 3) as pct
-from filtered f join truth t using (invoice_id)
-""")
-print("\n" + "=" * 84)
-print("TEST 4 -- invoices labelled FAILED that actually collected")
-print("=" * 84)
-print(cur.fetch_pandas_all().to_string(index=False))
-print("\n  Non-zero => your training target is wrong for these rows, and every model")
-print("  metric so far was computed against a corrupted label.")
-#%% Show me the orders
-# Run after gate_diagnostic.py -- reuses hidden_loss, base, df_pred.
+    order by collected desc
+    """)
+    src = cur.fetch_pandas_all()
+    print("\n" + "=" * 78)
+    print("SAME ORDERS, STRAIGHT FROM THE SOURCE TABLE")
+    print("=" * 78)
+    print(src.to_string(index=False))
+    print(f"\n  is_m0 = 1 anywhere above  -> NEVER_M0 is wrong; the June order_date filter")
+    print(f"                              dropped them, not a failed trial.")
+    print(f"  order_date outside June   -> confirms it.")
+    print(f"  is_m0 = 0 and collected>0 -> is_m0 does not mean what you were told.")
 
-import pandas as pd
 
-ids = hidden_loss['ORDER_ID'].tolist()
-print(f"{len(ids):,} orders. First 20:")
-print(ids[:20])
+#%% Verdict: bucket every 'never-M0-but-collected' order by the two suspects
+# Cross-tabulates the source truth: did it EVER make M0, and is its order_date inside
+# the June window load_cltv() filters on? If the mass lands in (is_m0=1, outside June),
+# the date filter -- not is_m0 -- is what's dropping them from tb.
+if len(collected):
+    ids = ','.join(str(i) for i in collected.index)   # all of them, not just top 50
+    cur = ctx.cursor()
+    cur.execute(f"""
+    select
+        iff(is_m0_ever = 1, 'is_m0=1 (made M0)', 'is_m0=0 (true non-M0)') as m0_bucket,
+        june_bucket,
+        count(*)                    as orders,
+        round(sum(collected), 2)    as collected
+    from (
+        select order_id,
+               max(is_m0)                                                       as is_m0_ever,
+               iff(min(order_date) >= '2025-06-01'
+                   and max(order_date) < '2025-07-01', 'in June', 'outside June') as june_bucket,
+               sum(iff(transaction_status = 'accepted', transaction_amount, 0))  as collected
+        from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+        where order_id in ({ids})
+        group by order_id
+    )
+    group by 1, 2
+    order by collected desc
+    """)
+    verdict = cur.fetch_pandas_all()
+    print("\n" + "=" * 78)
+    print("WHY THESE ORDERS ARE MISSING FROM tb  (source truth, all flagged orders)")
+    print("=" * 78)
+    print(verdict.to_string(index=False))
+    print("\n  Rows in 'is_m0=1 (made M0)' + 'outside June' == the load_cltv date filter")
+    print("  is throwing away real M0 orders. Fix: widen/remove the order_date window in")
+    print("  load_cltv() to match df_pred's range, or key NEVER_M0 off is_m0, not the merge.")
 
-# --- per-invoice timeline for a few of them ---------------------------------
-inv = (df_pred[df_pred['ORDER_ID'].isin(ids)]
-       .assign(TRANSACTION_DATETIME=lambda d: pd.to_datetime(d['TRANSACTION_DATETIME']))
-       .groupby(['ORDER_ID', 'INVOICE_ID'])
-       .agg(INV_NO=('INVOICE_NUMBER', 'first'),
-            FIRST_TXN=('TRANSACTION_DATETIME', 'min'),
-            LAST_TXN=('TRANSACTION_DATETIME', 'max'),
-            MAX_RETRY=('RETRIES', 'max'),
-            LABEL=('IS_EVENTUALLY_SUCCESSFUL', 'first'),
-            COLLECTED=('TRANSACTION_AMOUNT',
-                       lambda s: s[df_pred.loc[s.index, 'TRANSACTION_STATUS'] == 'accepted'].sum()))
-       .reset_index().sort_values(['ORDER_ID', 'FIRST_TXN']))
-
-cut_at = hidden_loss.set_index('ORDER_ID')['TRANSACTION_DATETIME']
-for oid in ids[:5]:
-    print(f"\n--- order {oid} | cut at {pd.to_datetime(cut_at[oid])} ---")
-    print(inv[inv['ORDER_ID'] == oid].drop(columns='ORDER_ID').to_string(index=False))
-
-# --- THE question: sequential or overlapping? -------------------------------
-# Was the later money collected by a LATER invoice (order survived the failure),
-# or by an invoice already running ALONGSIDE the failing one (overlap)?
-inv['PREV_LAST'] = inv.groupby('ORDER_ID')['LAST_TXN'].shift()
-inv['OVERLAPS_PREV'] = inv['FIRST_TXN'] < inv['PREV_LAST']
-
-print("\n" + "=" * 70)
-print("Do this order's invoices run CONCURRENTLY?")
-print("=" * 70)
-print(f"  invoices starting before the previous one ended: "
-      f"{inv['OVERLAPS_PREV'].mean():.1%}")
-print(f"  orders with any overlap: "
-      f"{inv.groupby('ORDER_ID')['OVERLAPS_PREV'].any().mean():.1%}")
-
-# Of the money collected after the cutoff, which invoice did it come from?
-paid_after = (df_pred[(df_pred['ORDER_ID'].isin(ids)) &
-                      (df_pred['TRANSACTION_STATUS'] == 'accepted')]
-              .assign(TRANSACTION_DATETIME=lambda d: pd.to_datetime(d['TRANSACTION_DATETIME'])))
-paid_after['CUT_AT'] = pd.to_datetime(paid_after['ORDER_ID'].map(cut_at))
-paid_after = paid_after[paid_after['TRANSACTION_DATETIME'] > paid_after['CUT_AT']]
-paid_after['CUT_INV_NO'] = paid_after['ORDER_ID'].map(hidden_loss.set_index('ORDER_ID')['INVOICE_NUMBER'])
-
-print(f"\n  money collected after cutoff, by invoice position:")
-print(f"    from a LATER invoice   : ${paid_after.loc[paid_after['INVOICE_NUMBER'] > paid_after['CUT_INV_NO'], 'TRANSACTION_AMOUNT'].sum():,.0f}"
-      f"   <- order survived the failed invoice")
-print(f"    from the SAME invoice  : ${paid_after.loc[paid_after['INVOICE_NUMBER'] == paid_after['CUT_INV_NO'], 'TRANSACTION_AMOUNT'].sum():,.0f}"
-      f"   <- should be $0: that invoice is labelled failed")
-print(f"    from an EARLIER invoice: ${paid_after.loc[paid_after['INVOICE_NUMBER'] < paid_after['CUT_INV_NO'], 'TRANSACTION_AMOUNT'].sum():,.0f}"
-      f"   <- only possible if invoices overlap")
+# =============================================================================
+# How big is the exposure? Free cuts are 76% of every cut you make.
+# =============================================================================
+print("\n" + "=" * 78)
+print("WHAT IF THE FREE CUTS AREN'T FREE?")
+print("=" * 78)
+free_at_002 = 25714   # from your p<0.02 row
+net_at_002 = 3359.43
+print(f"  Net @ p<0.02 : ${net_at_002:,.2f} on {free_at_002:,} free cuts")
+for per_order in [0.05, 0.10, 0.13, 0.20, 0.50]:
+    adj = net_at_002 - free_at_002 * per_order
+    flag = '  <-- Net goes NEGATIVE' if adj < 0 else ''
+    print(f"  if each free cut really costs ${per_order:.2f} -> Net ${adj:>10,.2f}{flag}")
+# %%
