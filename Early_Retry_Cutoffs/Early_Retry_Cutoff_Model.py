@@ -16,6 +16,8 @@ from catboost import CatBoostClassifier
 import os
 import joblib
 from sklearn.frozen import FrozenEstimator
+import matplotlib.pyplot as plt
+from catboost import CatBoostClassifier, Pool
 
 #%%  Fetch Data from Snowflake
 # Start fetching data directly from Snowflake
@@ -40,13 +42,7 @@ df = cur.fetch_pandas_all()
 
 
 #%% Model Training
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
-from catboost import CatBoostClassifier, Pool
-
+# Model Training Starts Here
 sampled_df = df
 
 # Must match the DATEDIFF threshold in the training SQL's in-flight filter
@@ -213,7 +209,7 @@ stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=tex
 # =====================================================================
 print("Training Base Model...")
 base_model = CatBoostClassifier(
-    iterations=2000,
+    iterations=800,
     learning_rate=0.1,          # Updated Learning Rate
     depth=6,
     task_type="CPU",
@@ -221,7 +217,7 @@ base_model = CatBoostClassifier(
     custom_metric=['AUC'],
     l2_leaf_reg=6,
     thread_count=-1,
-    early_stopping_rounds=100,
+    early_stopping_rounds=50,
     verbose=50,
     random_state=42,
     cat_features=cat_features,
@@ -350,7 +346,7 @@ drop_cols = artifact['drop_cols']
 print("Loading new data...")
 # Assuming 'cur' (your database cursor) is already initialized and active in your environment
 cur.execute(("use database dbt_prod"))
-cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025 WHERE TRANSACTION_STATUS != 'accepted' ")
+cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025 ")
 df_062025 = cur.fetch_pandas_all()
 df_pred = df_062025.copy()
 
@@ -471,7 +467,7 @@ y_probs_062025 = df_pred['SUCCESS_PROBABILITY'].values
 
 plot_business_confusion_matrix(y_true=y_true_062025, 
                                y_probs=y_probs_062025, 
-                               threshold=0.05, 
+                               threshold=0.15, 
                                dataset_name="Random Test Set (In-Sample)")
 
 
@@ -545,8 +541,8 @@ print("\nGenerating Order-Level Confusion Matrices...")
 # 2. Evaluate the Random Holdout Test Set (In-Sample)
 plot_order_level_confusion_matrix(
     order_ids=random_test_df['ORDER_ID'].values, 
-    y_true=y_random_test.values, 
-    y_probs=random_probs, 
+    y_true=y_true_062025, 
+    y_probs=y_probs_062025, 
     threshold=0.03, 
     dataset_name="Random Test Set (In-Sample)"
 )
@@ -614,7 +610,7 @@ shap.plots.waterfall(shap_explanation[0], show=False)
 plt.tight_layout()
 plt.show()
 
-#%% ECLTV based cancellation 
+#%% ECLTV based cancellation MIGHT BE WRONG 
 import pandas as pd
 import numpy as np
 
@@ -799,4 +795,473 @@ def top_divergent_orders(df_pred, prob_threshold=0.10, ecltv_max_threshold=20, t
 
 top50 = top_divergent_orders(df_pred, prob_threshold=0.10, ecltv_max_threshold=20, top_n=50)
 print(top50.to_string(index=False))
-# %%
+#%% ECLTV based cancellation
+import pandas as pd
+import numpy as np
+
+RETRY_COST = 0.1
+
+
+def load_cltv():
+    cur = ctx.cursor()
+    cur.execute("""
+    with ecltv as (
+        -- GROUP BY guards against >1 row per order fanning out the join below.
+        select order_id, max(cltv_pred_mean) as ecltv_1y
+        from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER
+        group by 1
+    ),
+    tb as (
+        select
+            order_id,
+            div0(sum(case when is_sale = 1 and is_daydiff_interval_txn_order_0360
+                          then transaction_amount else 0 end),
+                 count(distinct case when is_m0 = 1 and is_daydiff_interval_txn_order_0360
+                                     then order_id else null end)) as cltv_360,
+            max(ecltv_1y) as ecltv_1y
+        from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+        left join ecltv using (order_id)
+        where order_date >= '2025-06-01' and order_date < '2025-07-01'
+          and is_m0 = 1
+        group by 1
+    )
+    select * from tb
+    """)
+    return cur.fetch_pandas_all()
+
+
+def prepare_cutoff_frame(df_pred):
+    df = df_pred.copy()
+    df['TRANSACTION_DATETIME'] = pd.to_datetime(df['TRANSACTION_DATETIME'])
+    df = df.merge(load_cltv(), on='ORDER_ID', how='left', indicator='_src')
+
+    # tb is filtered to is_m0 = 1, so absent from it == never signed up for trial ==
+    # never collected and never will. Real zeros, not missing data -- and the cheapest
+    # orders to cut. Keep them.
+    never_m0 = df['_src'] == 'left_only'
+    df.loc[never_m0, ['CLTV_360', 'ECLTV_1Y']] = 0.0
+    df = df.drop(columns='_src')
+
+    # Made M0 but no ECLTV prediction: CLTV_360 is real, the projection isn't. Left NaN
+    # so `ECLTV_1Y < cap` is False and they are never cut.
+    unpriceable = df['ECLTV_1Y'].isna()
+
+    print(f"orders: {df.ORDER_ID.nunique():,} total | "
+          f"{df.loc[never_m0, 'ORDER_ID'].nunique():,} never made M0 (loss=0, kept) | "
+          f"{df.loc[unpriceable, 'ORDER_ID'].nunique():,} no ECLTV (never cut)")
+
+    # Sanity: never-M0 orders should have collected nothing.
+    bad = df.loc[never_m0, 'HISTORICAL_COLLECTED_AMOUNT'].max()
+    if pd.notna(bad) and bad > 0:
+        print(f"  WARNING: a never-M0 order shows ${bad:,.2f} collected -- is_m0 and "
+              f"HISTORICAL_COLLECTED_AMOUNT disagree.")
+
+    df = df.sort_values(['ORDER_ID', 'TRANSACTION_DATETIME'])
+
+    # Cutting off cancels the order, so every remaining attempt across all of its
+    # invoices is saved. Decision is pre-attempt, so the current row counts too.
+    df['ORDER_ATTEMPTS_SAVED'] = (df.groupby('ORDER_ID')['TRANSACTION_ID'].transform('size')
+                                  - df.groupby('ORDER_ID').cumcount())
+    return df
+
+
+def _score(cut, label):
+    cut = cut.copy()
+    cut['money_gained'] = cut['ORDER_ATTEMPTS_SAVED'] * RETRY_COST
+
+    # clip(0): CLTV_360 below already-collected means the two windows count different
+    # things, not that cancelling earned us money.
+    cut['loss_actual'] = (cut['CLTV_360'] - cut['HISTORICAL_COLLECTED_AMOUNT']).clip(lower=0)
+    return {
+        'Rule': label,
+        'Orders Cut': len(cut),
+        'Free Cuts (no CLTV)': int((cut['CLTV_360'] == 0).sum()),
+        'Total Gain': round(cut['money_gained'].sum(), 2),
+        'Loss (Actual)': round(cut['loss_actual'].sum(), 2),
+        'Net (Actual)': round((cut['money_gained'] - cut['loss_actual']).sum(), 2),
+    }
+
+
+def evaluate_cutoff_thresholds(df, thresholds_to_test, ecltv_max_threshold=float('inf')):
+    rows = []
+    for threshold in thresholds_to_test:
+        cut = df[(df['SUCCESS_PROBABILITY'] < threshold) &
+                 (df['ECLTV_1Y'] < ecltv_max_threshold)].drop_duplicates('ORDER_ID', keep='first')
+        rows.append(_score(cut, f'model p < {threshold}'))
+    return pd.DataFrame(rows)
+
+
+# --- Run ---------------------------------------------------------------------
+cutoff_df = prepare_cutoff_frame(df_pred)
+
+ECLTV_CAP = 20
+test_thresholds = [0.01, 0.02, 0.03, 0.05, 0.10, 0.15, 0.20, 0.30, 0.40]
+
+impact_report = evaluate_cutoff_thresholds(cutoff_df, test_thresholds, ECLTV_CAP)
+print(f"\n=== Model-driven cutoff (ECLTV cap {ECLTV_CAP}) ===")
+print(impact_report.to_string(index=False))
+
+# Does the IS_EVENTUALLY_SUCCESSFUL gate change anything? If not, the question is moot.
+_c = cutoff_df[(cutoff_df['SUCCESS_PROBABILITY'] < 0.05) &
+               (cutoff_df['ECLTV_1Y'] < ECLTV_CAP)].drop_duplicates('ORDER_ID', keep='first').copy()
+_ungated = (_c['CLTV_360'] - _c['HISTORICAL_COLLECTED_AMOUNT']).clip(lower=0)
+_gated = np.where(_c['IS_EVENTUALLY_SUCCESSFUL'] == 1, _ungated, 0.0)
+_diff = _ungated.values != _gated
+print(f"\nGate check @0.05: {_diff.sum():,}/{len(_c):,} orders differ, "
+      f"${_ungated[_diff].sum():,.0f} at stake. Zero => a failed invoice really does end "
+      f"the order, and the gate is redundant.")
+
+# 20 example orders where the gate flips the value (_diff is positional, so use iloc)
+_diff_examples = _c.iloc[_diff][['ORDER_ID', 'IS_EVENTUALLY_SUCCESSFUL',
+                                 'CLTV_360', 'HISTORICAL_COLLECTED_AMOUNT',
+                                 'SUCCESS_PROBABILITY', 'ECLTV_1Y']].head(20)
+print("\n20 example orders that differ:")
+print(_diff_examples.to_string(index=False))
+
+
+#%%
+#%% Ablation: which change moved the number?
+# Starts from YOUR original calculation and applies my changes one at a time.
+# The "Delta Net" column is the damage (or credit) attributable to that one change.
+
+import pandas as pd
+import numpy as np
+
+RETRY_COST = 0.1
+THRESHOLD = 0.05     # ablate at one fixed threshold
+ECLTV_CAP = 20
+
+
+def load_cltv(dedupe):
+    """dedupe=False reproduces your original ecltv CTE (no GROUP BY)."""
+    ecltv_cte = ("select order_id, max(cltv_pred_mean) as ecltv_1y "
+                 "from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER group by 1") if dedupe else \
+                ("select order_id, cltv_pred_mean as ecltv_1y "
+                 "from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER")
+    cur = ctx.cursor()
+    cur.execute(f"""
+    with ecltv as ({ecltv_cte}),
+    tb as (
+        select order_id,
+               div0(sum(case when is_sale = 1 and is_daydiff_interval_txn_order_0360
+                             then transaction_amount else 0 end),
+                    count(distinct case when is_m0 = 1 and is_daydiff_interval_txn_order_0360
+                                        then order_id else null end)) as cltv_360,
+               max(ecltv_1y) as ecltv_1y
+        from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+        left join ecltv using (order_id)
+        where order_date >= '2025-06-01' and order_date < '2025-07-01' and is_m0 = 1
+        group by 1
+    )
+    select * from tb
+    """)
+    return cur.fetch_pandas_all()
+
+
+def build(df_pred, cltv_df):
+    df = df_pred.copy()
+    df['TRANSACTION_DATETIME'] = pd.to_datetime(df['TRANSACTION_DATETIME'])
+    df = df.merge(cltv_df, on='ORDER_ID', how='left', indicator='_src')
+    df['NEVER_M0'] = df['_src'] == 'left_only'      # absent from tb => never signed up
+    df = df.drop(columns='_src').sort_values(['ORDER_ID', 'TRANSACTION_DATETIME'])
+    df['ORDER_MAX_RETRY'] = df.groupby('ORDER_ID')['RETRIES'].transform('max')
+    df['ORDER_ATTEMPTS_SAVED'] = (df.groupby('ORDER_ID')['TRANSACTION_ID'].transform('size')
+                                  - df.groupby('ORDER_ID').cumcount())
+    return df
+
+
+def score(df, fill0, clip, gate, gain_mode, plus1):
+    d = df.copy()
+    if fill0:
+        # your version: every missing CLTV becomes 0, including paying customers
+        d['ECLTV_1Y'] = d['ECLTV_1Y'].fillna(0)
+        d['CLTV_360'] = d['CLTV_360'].fillna(0)
+    else:
+        # mine: never-M0 are true zeros; made-M0-but-no-eCLTV stay NaN -> never cut
+        d.loc[d['NEVER_M0'], ['CLTV_360', 'ECLTV_1Y']] = 0.0
+
+    cut = (d[(d['SUCCESS_PROBABILITY'] < THRESHOLD) & (d['ECLTV_1Y'] < ECLTV_CAP)]
+           .drop_duplicates('ORDER_ID', keep='first').copy())
+
+    if gain_mode == 'attempts':
+        cut['gain'] = cut['ORDER_ATTEMPTS_SAVED'] * RETRY_COST   # pre-attempt by construction
+    else:
+        cut['gain'] = (cut['ORDER_MAX_RETRY'] - cut['RETRIES'] + int(plus1)) * RETRY_COST
+
+    loss = cut['CLTV_360'] - cut['HISTORICAL_COLLECTED_AMOUNT']
+    if clip:
+        loss = loss.clip(lower=0)
+    if gate:
+        loss = loss.where(cut['IS_EVENTUALLY_SUCCESSFUL'] == 1, 0.0)
+    cut['loss'] = loss
+    cut['net'] = cut['gain'] - cut['loss']
+    return cut
+
+
+# --- Pre-flight: are the ingredients even in play? ---------------------------
+cur = ctx.cursor()
+cur.execute("""select count(*) as dupe_orders from (
+                 select order_id from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER
+                 group by 1 having count(*) > 1)""")
+dupes = cur.fetch_pandas_all().iloc[0, 0]
+
+cltv_dedup = load_cltv(dedupe=True)
+cltv_raw = load_cltv(dedupe=False)
+base_dedup = build(df_pred, cltv_dedup)
+base_raw = build(df_pred, cltv_raw)
+
+n_orders = base_dedup['ORDER_ID'].nunique()
+never_m0 = base_dedup.loc[base_dedup['NEVER_M0'], 'ORDER_ID'].nunique()
+no_ecltv = base_dedup.loc[base_dedup['ECLTV_1Y'].isna() & ~base_dedup['NEVER_M0'], 'ORDER_ID'].nunique()
+multi_inv = (base_dedup.groupby('ORDER_ID')['INVOICE_ID'].nunique() > 1).mean()
+
+print("=" * 76)
+print("PRE-FLIGHT -- how much can each change possibly matter?")
+print("=" * 76)
+print(f"  orders in FCT_ECLTV_ORDER with >1 row : {dupes:,}   <- if 0, the SQL dedupe is a no-op")
+print(f"  orders that never made M0             : {never_m0:,} / {n_orders:,} ({never_m0/n_orders:.1%})")
+print(f"    -> we AGREE on these (loss truly 0)")
+print(f"  orders made M0 but no eCLTV row       : {no_ecltv:,} / {n_orders:,} ({no_ecltv/n_orders:.1%})")
+print(f"    -> your fillna(0) marks these free to cut; I refuse to cut them")
+print(f"  orders with >1 invoice                : {multi_inv:.1%}")
+print(f"    -> only these can make the GAIN formulas diverge")
+
+# --- Cumulative ablation -----------------------------------------------------
+STEPS = [
+    ('0. your original',              dict(dedupe=False, fill0=True,  clip=False, gate=True,  gain_mode='order_max', plus1=False)),
+    ('1. + dedupe ecltv (SQL)',       dict(dedupe=True,  fill0=True,  clip=False, gate=True,  gain_mode='order_max', plus1=False)),
+    ('2. + split the two NaN cases',  dict(dedupe=True,  fill0=False, clip=False, gate=True,  gain_mode='order_max', plus1=False)),
+    ('3. + clip loss at 0',           dict(dedupe=True,  fill0=False, clip=True,  gate=True,  gain_mode='order_max', plus1=False)),
+    ('4. + drop success gate',        dict(dedupe=True,  fill0=False, clip=True,  gate=False, gain_mode='order_max', plus1=False)),
+    ('5. + pre-attempt (+1)',         dict(dedupe=True,  fill0=False, clip=True,  gate=False, gain_mode='order_max', plus1=True)),
+    ('6. + count order-wide attempts', dict(dedupe=True, fill0=False, clip=True,  gate=False, gain_mode='attempts',  plus1=True)),
+]
+
+rows, prev_net = [], None
+for label, cfg in STEPS:
+    base = base_dedup if cfg.pop('dedupe') else base_raw
+    cut = score(base, **cfg)
+    net = cut['net'].sum()
+    rows.append({
+        'Step': label,
+        'Orders Cut': len(cut),
+        'Gain': round(cut['gain'].sum(), 2),
+        'Loss': round(cut['loss'].sum(), 2),
+        'Net': round(net, 2),
+        'Delta Net': '' if prev_net is None else round(net - prev_net, 2),
+    })
+    prev_net = net
+
+ablation = pd.DataFrame(rows)
+print("\n" + "=" * 76)
+print(f"CUMULATIVE ABLATION  (threshold {THRESHOLD}, ECLTV cap {ECLTV_CAP})")
+print("=" * 76)
+print(ablation.to_string(index=False))
+print("\n  Row 0 = your number. Row 6 = mine. The biggest |Delta Net| is your answer.")
+
+# --- Where exactly does the gain diverge? ------------------------------------
+final = score(base_dedup, fill0=False, clip=True, gate=False, gain_mode='attempts', plus1=True)
+final['gain_yours'] = (final['ORDER_MAX_RETRY'] - final['RETRIES']) * RETRY_COST
+final['n_invoices'] = final['ORDER_ID'].map(base_dedup.groupby('ORDER_ID')['INVOICE_ID'].nunique())
+final['gain_diff'] = final['gain'] - final['gain_yours']
+
+print("\n" + "=" * 76)
+print("GAIN DIVERGENCE BY INVOICE COUNT")
+print("=" * 76)
+by_inv = final.groupby(final['n_invoices'].clip(upper=4)).agg(
+    orders=('gain', 'size'), yours=('gain_yours', 'mean'),
+    mine=('gain', 'mean'), total_diff=('gain_diff', 'sum'))
+by_inv['ratio'] = (by_inv['mine'] / by_inv['yours']).round(2)
+print(by_inv.round(2).to_string())
+print("\n  Single-invoice orders should be ~1.0x (only the +1 differs).")
+print("  Multi-invoice orders diverge because retry numbers restart at 0 each invoice,")
+print("  so 'max retry - current retry' cannot see the invoices cancelling also kills.")
+
+#%%
+#%% Why does dropping the success gate cost $146k?
+# Three candidates. This tells you which.
+#   A: orders genuinely collect after a failed invoice   -> gate is wrong, loss is real
+#   B: labels are wrong (accepted txn hidden by filters) -> loss real AND target corrupted
+#   C: CLTV_360 counts money HIST cannot see             -> loss is phantom, gate masked it
+
+import pandas as pd
+import numpy as np
+
+# =============================================================================
+# TEST 1 -- how much collected money do the extract's filters hide?
+# base_transactions requires retries IS NOT NULL AND transaction_type IN
+# ('sale','capture'). Anything accepted outside that is invisible to
+# HISTORICAL_COLLECTED_AMOUNT *and* to MAX(accepted) -- i.e. to the label.
+# =============================================================================
+cur = ctx.cursor()
+cur.execute("""
+select
+    case when retries is null then 'retries IS NULL'
+         when transaction_type not in ('sale','capture') then 'other transaction_type'
+         else 'visible to extract' end          as bucket,
+    transaction_type,
+    count(*)                                     as txns,
+    sum(iff(transaction_status='accepted',1,0))  as accepted_txns,
+    round(sum(iff(transaction_status='accepted', transaction_amount, 0)), 2) as accepted_dollars
+from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+where order_date >= '2025-06-01' and order_date < '2025-07-01'
+group by 1, 2
+order by accepted_dollars desc
+""")
+hidden = cur.fetch_pandas_all()
+print("=" * 84)
+print("TEST 1 -- collected money the extract cannot see")
+print("=" * 84)
+print(hidden.to_string(index=False))
+vis = hidden.loc[hidden.BUCKET == 'visible to extract', 'ACCEPTED_DOLLARS'].sum()
+inv = hidden.loc[hidden.BUCKET != 'visible to extract', 'ACCEPTED_DOLLARS'].sum()
+print(f"\n  visible ${vis:,.0f} | INVISIBLE ${inv:,.0f} ({inv/(vis+inv):.1%} of all collections)")
+print("  Any invisible dollars => CLTV_360 sees them, HIST does not, and MAX(accepted)")
+print("  misses them too. That is hypothesis B/C, and it breaks the label as well.")
+
+# =============================================================================
+# TEST 2 -- per order: does CLTV_360 exceed everything the extract shows collected?
+# If yes for nearly every order, the gap is an accounting artifact, not revenue.
+# =============================================================================
+extract_collected = (df_pred[df_pred['TRANSACTION_STATUS'] == 'accepted']
+                     .groupby('ORDER_ID')['TRANSACTION_AMOUNT'].sum().rename('EXTRACT_COLLECTED'))
+
+cmp = (load_cltv(dedupe=True).set_index('ORDER_ID')
+       .join(extract_collected, how='inner'))
+cmp['GAP'] = cmp['CLTV_360'] - cmp['EXTRACT_COLLECTED']
+
+print("\n" + "=" * 84)
+print("TEST 2 -- CLTV_360 minus what the extract says was collected, per order")
+print("=" * 84)
+print(cmp['GAP'].describe().round(2).to_string())
+print(f"\n  orders with GAP > $0.01 : {(cmp['GAP'] > 0.01).mean():.1%}")
+print(f"  median GAP              : ${cmp['GAP'].median():.2f}")
+print(f"  GAP == a tight cluster? -> a fixed per-order charge the extract drops (the M0 trial)")
+print("\n  GAP distribution:")
+print(cmp['GAP'].round(0).value_counts().head(8).to_string())
+
+# =============================================================================
+# TEST 3 -- THE DECIDER. For the orders driving the $146k, is there actually an
+# accepted transaction after the cutoff point, in the extract itself?
+#   found => hypothesis A (real revenue after a failed invoice)
+#   none  => hypothesis B/C (the money is only in CLTV_360, not in your data)
+# =============================================================================
+base = build(df_pred, load_cltv(dedupe=True))
+base.loc[base['NEVER_M0'], ['CLTV_360', 'ECLTV_1Y']] = 0.0
+
+cut = (base[(base['SUCCESS_PROBABILITY'] < 0.05) & (base['ECLTV_1Y'] < 20)]
+       .drop_duplicates('ORDER_ID', keep='first').copy())
+cut['loss'] = (cut['CLTV_360'] - cut['HISTORICAL_COLLECTED_AMOUNT']).clip(lower=0)
+
+# the population the gate was hiding
+hidden_loss = cut[(cut['IS_EVENTUALLY_SUCCESSFUL'] == 0) & (cut['loss'] > 0)]
+print("\n" + "=" * 84)
+print("TEST 3 -- the orders the gate was suppressing")
+print("=" * 84)
+print(f"  orders: {len(hidden_loss):,}   loss they carry: ${hidden_loss['loss'].sum():,.0f}")
+
+# for each, is there an accepted txn in the extract after the cutoff datetime?
+cutoff_at = hidden_loss.set_index('ORDER_ID')['TRANSACTION_DATETIME']
+acc = df_pred[df_pred['TRANSACTION_STATUS'] == 'accepted'][['ORDER_ID', 'TRANSACTION_DATETIME', 'TRANSACTION_AMOUNT']]
+acc = acc[acc['ORDER_ID'].isin(cutoff_at.index)].copy()
+acc['CUTOFF_AT'] = acc['ORDER_ID'].map(cutoff_at)
+after = acc[pd.to_datetime(acc['TRANSACTION_DATETIME']) > pd.to_datetime(acc['CUTOFF_AT'])]
+
+n_with_real = after['ORDER_ID'].nunique()
+print(f"  ...of which have a REAL accepted txn after the cutoff : {n_with_real:,} "
+      f"({n_with_real/max(len(hidden_loss),1):.1%})")
+print(f"  ...dollars actually collected after the cutoff        : ${after['TRANSACTION_AMOUNT'].sum():,.0f}")
+print(f"  ...dollars CLTV_360 claims were lost                  : ${hidden_loss['loss'].sum():,.0f}")
+
+ratio = after['TRANSACTION_AMOUNT'].sum() / max(hidden_loss['loss'].sum(), 1e-9)
+print(f"\n  RATIO real/claimed = {ratio:.1%}")
+print("    ~100% -> HYPOTHESIS A. Orders do survive failed invoices. Your gate is wrong,")
+print("             the loss is real, and cutting at 0.05 destroys value.")
+print("    ~0%   -> HYPOTHESIS B/C. The money exists only in CLTV_360, not in your")
+print("             transactions. The loss is an accounting artifact -- and the same")
+print("             filters that hide it also corrupt IS_EVENTUALLY_SUCCESSFUL.")
+
+# =============================================================================
+# TEST 4 -- if B: how many invoices are labelled failed but actually collected?
+# =============================================================================
+cur.execute("""
+with filtered as (
+    select invoice_id, max(iff(transaction_status='accepted',1,0)) as lbl
+    from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+    where retries is not null and transaction_type in ('sale','capture')
+      and order_date >= '2025-06-01' and order_date < '2025-07-01'
+    group by 1
+),
+truth as (
+    select invoice_id, max(iff(transaction_status='accepted',1,0)) as lbl
+    from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+    where order_date >= '2025-06-01' and order_date < '2025-07-01'
+    group by 1
+)
+select count(*) as invoices,
+       sum(iff(f.lbl=0 and t.lbl=1,1,0)) as labelled_fail_but_paid,
+       round(100*avg(iff(f.lbl=0 and t.lbl=1,1,0)), 3) as pct
+from filtered f join truth t using (invoice_id)
+""")
+print("\n" + "=" * 84)
+print("TEST 4 -- invoices labelled FAILED that actually collected")
+print("=" * 84)
+print(cur.fetch_pandas_all().to_string(index=False))
+print("\n  Non-zero => your training target is wrong for these rows, and every model")
+print("  metric so far was computed against a corrupted label.")
+#%% Show me the orders
+# Run after gate_diagnostic.py -- reuses hidden_loss, base, df_pred.
+
+import pandas as pd
+
+ids = hidden_loss['ORDER_ID'].tolist()
+print(f"{len(ids):,} orders. First 20:")
+print(ids[:20])
+
+# --- per-invoice timeline for a few of them ---------------------------------
+inv = (df_pred[df_pred['ORDER_ID'].isin(ids)]
+       .assign(TRANSACTION_DATETIME=lambda d: pd.to_datetime(d['TRANSACTION_DATETIME']))
+       .groupby(['ORDER_ID', 'INVOICE_ID'])
+       .agg(INV_NO=('INVOICE_NUMBER', 'first'),
+            FIRST_TXN=('TRANSACTION_DATETIME', 'min'),
+            LAST_TXN=('TRANSACTION_DATETIME', 'max'),
+            MAX_RETRY=('RETRIES', 'max'),
+            LABEL=('IS_EVENTUALLY_SUCCESSFUL', 'first'),
+            COLLECTED=('TRANSACTION_AMOUNT',
+                       lambda s: s[df_pred.loc[s.index, 'TRANSACTION_STATUS'] == 'accepted'].sum()))
+       .reset_index().sort_values(['ORDER_ID', 'FIRST_TXN']))
+
+cut_at = hidden_loss.set_index('ORDER_ID')['TRANSACTION_DATETIME']
+for oid in ids[:5]:
+    print(f"\n--- order {oid} | cut at {pd.to_datetime(cut_at[oid])} ---")
+    print(inv[inv['ORDER_ID'] == oid].drop(columns='ORDER_ID').to_string(index=False))
+
+# --- THE question: sequential or overlapping? -------------------------------
+# Was the later money collected by a LATER invoice (order survived the failure),
+# or by an invoice already running ALONGSIDE the failing one (overlap)?
+inv['PREV_LAST'] = inv.groupby('ORDER_ID')['LAST_TXN'].shift()
+inv['OVERLAPS_PREV'] = inv['FIRST_TXN'] < inv['PREV_LAST']
+
+print("\n" + "=" * 70)
+print("Do this order's invoices run CONCURRENTLY?")
+print("=" * 70)
+print(f"  invoices starting before the previous one ended: "
+      f"{inv['OVERLAPS_PREV'].mean():.1%}")
+print(f"  orders with any overlap: "
+      f"{inv.groupby('ORDER_ID')['OVERLAPS_PREV'].any().mean():.1%}")
+
+# Of the money collected after the cutoff, which invoice did it come from?
+paid_after = (df_pred[(df_pred['ORDER_ID'].isin(ids)) &
+                      (df_pred['TRANSACTION_STATUS'] == 'accepted')]
+              .assign(TRANSACTION_DATETIME=lambda d: pd.to_datetime(d['TRANSACTION_DATETIME'])))
+paid_after['CUT_AT'] = pd.to_datetime(paid_after['ORDER_ID'].map(cut_at))
+paid_after = paid_after[paid_after['TRANSACTION_DATETIME'] > paid_after['CUT_AT']]
+paid_after['CUT_INV_NO'] = paid_after['ORDER_ID'].map(hidden_loss.set_index('ORDER_ID')['INVOICE_NUMBER'])
+
+print(f"\n  money collected after cutoff, by invoice position:")
+print(f"    from a LATER invoice   : ${paid_after.loc[paid_after['INVOICE_NUMBER'] > paid_after['CUT_INV_NO'], 'TRANSACTION_AMOUNT'].sum():,.0f}"
+      f"   <- order survived the failed invoice")
+print(f"    from the SAME invoice  : ${paid_after.loc[paid_after['INVOICE_NUMBER'] == paid_after['CUT_INV_NO'], 'TRANSACTION_AMOUNT'].sum():,.0f}"
+      f"   <- should be $0: that invoice is labelled failed")
+print(f"    from an EARLIER invoice: ${paid_after.loc[paid_after['INVOICE_NUMBER'] < paid_after['CUT_INV_NO'], 'TRANSACTION_AMOUNT'].sum():,.0f}"
+      f"   <- only possible if invoices overlap")
