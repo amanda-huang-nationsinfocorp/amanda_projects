@@ -122,38 +122,47 @@ sampled_df[numeric_cols] = sampled_df[numeric_cols].fillna(-1)
 # =====================================================================
 # 3. Hybrid Split (As-Of-Date OOT + Order-Grouped Random)
 # =====================================================================
-print("Splitting data (As-Of OOT + Order-Grouped Random)...")
+# =====================================================================
+# 3. Dynamic Chronological Split (85% Past / 15% Recent OOT)
+# =====================================================================
+print("Splitting data (85% Past / 15% Recent OOT)...")
 
-ASOF_DATE = pd.Timestamp('2026-01-15')   # "retrain the model on this date"
-OOT_END   = pd.Timestamp('2026-03-01')   # MUST be <= max ORDER_DATE in the extract
+# 1. Determine the maximum date in the dataset to calculate maturity
+MAX_DATE = sampled_df['TRANSACTION_DATETIME'].max()
+MATURITY_CUTOFF = MAX_DATE - pd.Timedelta(days=MATURITY_DAYS)
 
+# 2. Get invoice-level start times
 invoice_elig = sampled_df.groupby('INVOICE_ID', sort=False).agg(
-    RESOLVED_AT=('RESOLVED_AT', 'first'),
-    INVOICE_LAST_TXN=('INVOICE_LAST_TXN', 'first'),
+    INVOICE_START=('TRANSACTION_DATETIME', 'min')
 )
-eligible_invoices = invoice_elig.index[
-    (invoice_elig['RESOLVED_AT'] < ASOF_DATE) &
-    (invoice_elig['INVOICE_LAST_TXN'] < ASOF_DATE)
-]
 
-past_data = sampled_df[
-    sampled_df['INVOICE_ID'].isin(eligible_invoices) &
-    (sampled_df['TRANSACTION_DATETIME'] < ASOF_DATE)
-].copy()
+# 3. Filter for ONLY completely finished invoices (started at least 30 days ago)
+mature_invoices = invoice_elig[invoice_elig['INVOICE_START'] <= MATURITY_CUTOFF].copy()
 
-oot_test_df = sampled_df[
-    (sampled_df['TRANSACTION_DATETIME'] >= ASOF_DATE) &
-    (sampled_df['TRANSACTION_DATETIME'] < OOT_END)
-].copy()
+# 4. Find the chronological cutoff date that splits the mature invoices 85/15
+split_date = mature_invoices['INVOICE_START'].quantile(0.85)
 
+print(f"  Dataset max date: {MAX_DATE.date()}")
+print(f"  Maturity cutoff:  {MATURITY_CUTOFF.date()}")
+print(f"  85/15 Split date: {split_date.date()}")
+
+# 5. Split the mature invoices into Past and OOT based on the split date
+past_invoices = mature_invoices[mature_invoices['INVOICE_START'] < split_date].index
+oot_invoices  = mature_invoices[mature_invoices['INVOICE_START'] >= split_date].index
+
+# 6. Build the final dataframes (keeping all transactions tied to these invoices)
+past_data = sampled_df[sampled_df['INVOICE_ID'].isin(past_invoices)].copy()
+oot_test_df = sampled_df[sampled_df['INVOICE_ID'].isin(oot_invoices)].copy()
+
+# Safety check: Ensure no invoice exists in both datasets
 assert not (set(past_data['INVOICE_ID']) & set(oot_test_df['INVOICE_ID'])), \
-    "invoices straddle the as-of boundary"
+    "Error: Invoices straddle the split boundary"
 
 print(f"  past_data   : {len(past_data):>9,} rows | {past_data['ORDER_ID'].nunique():>7,} orders")
 print(f"  oot_test_df : {len(oot_test_df):>9,} rows | {oot_test_df['ORDER_ID'].nunique():>7,} orders")
-print(f"  orders in both (new invoices, expected): "
+print(f"  orders in both (expected if customers return): "
       f"{len(set(past_data['ORDER_ID']) & set(oot_test_df['ORDER_ID'])):,}")
-print(f"  dropped (unresolved at ASOF / beyond OOT_END): "
+print(f"  dropped (immature, still in-flight): "
       f"{len(sampled_df) - len(past_data) - len(oot_test_df):,} rows")
 
 # --- FIX 1: order-grouped assignment --------------------------------------------
@@ -209,7 +218,7 @@ stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=tex
 # =====================================================================
 print("Training Base Model...")
 base_model = CatBoostClassifier(
-    iterations=800,
+    iterations=200,
     learning_rate=0.1,          # Updated Learning Rate
     depth=6,
     task_type="CPU",
@@ -318,8 +327,6 @@ model_artifact = {
     'cat_features': cat_features,
     'text_features': text_features,
     'drop_cols': drop_cols,
-    'asof_date': ASOF_DATE,      # CHANGED: what the model knew, and when
-    'oot_end': OOT_END,
 }
 
 # 3. Save the artifact to the script's directory
@@ -328,6 +335,10 @@ joblib.dump(model_artifact, model_path)
 print(f"Model artifact successfully saved to: {model_path}")
 
 #%% Predictions
+import os
+import joblib
+import pandas as pd
+from sklearn.metrics import roc_auc_score # <-- Added Import
 
 # 1. Load the Model and Metadata
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -344,18 +355,15 @@ drop_cols = artifact['drop_cols']
 
 # 2. Load and Preprocess New Data
 print("Loading new data...")
-# Assuming 'cur' (your database cursor) is already initialized and active in your environment
+# Assuming 'cur' (your database cursor) is already initialized and active
 cur.execute(("use database dbt_prod"))
-cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025 ")
+cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_SAMPLE_062025")
 df_062025 = cur.fetch_pandas_all()
 df_pred = df_062025.copy()
 
 print("Applying strict preprocessing rules...")
 
 # 1. Format specific string columns if they exist
-# CHANGED: mirrors section 1 -- DECLINE_FAMILY comes from LAST_DECLINE_CODE now.
-# Without this the model's DECLINE_FAMILY column is missing and the reindex below
-# raises a KeyError.
 if 'LAST_DECLINE_CODE' in df_pred.columns:
     df_pred['LAST_DECLINE_CODE'] = df_pred['LAST_DECLINE_CODE'].astype(str)
     df_pred['DECLINE_FAMILY'] = df_pred['LAST_DECLINE_CODE'].str[0]
@@ -379,13 +387,11 @@ print("Extracting feature names from the nested model...")
 
 # Dig into the CalibratedClassifierCV
 if hasattr(calibrated_model, 'calibrated_classifiers_'):
-    # Grab the wrapper from the first fold
     base_wrapper = calibrated_model.calibrated_classifiers_[0].estimator
 else:
-    # Fallback if calibrated without CV somehow
     base_wrapper = calibrated_model.estimator
 
-# Dig into your custom FrozenEstimator (Checking common attribute names)
+# Dig into your custom FrozenEstimator
 if hasattr(base_wrapper, 'estimator'):
     actual_catboost = base_wrapper.estimator
 elif hasattr(base_wrapper, 'model'):
@@ -401,7 +407,7 @@ print("Generating predictions...")
 # Ensure column order matches training exactly
 X_new = X_new[feature_names]
 
-# Get the probability of the positive class (IS_EVENTUALLY_SUCCESSFUL = 1)
+# Get the probability of the positive class
 probabilities = calibrated_model.predict_proba(X_new)[:, 1]
 
 # Attach probabilities back to the original dataframe
@@ -409,6 +415,26 @@ df_pred['SUCCESS_PROBABILITY'] = probabilities
 
 print("Predictions successfully generated and attached!")
 
+# =====================================================================
+# 4. Evaluate Performance (NEW AUC SECTION)
+# =====================================================================
+print("\nEvaluating Model Performance...")
+
+if 'IS_EVENTUALLY_SUCCESSFUL' in df_pred.columns:
+    # Filter out any rows where the target might be NaN (unresolved invoices)
+    valid_mask = df_pred['IS_EVENTUALLY_SUCCESSFUL'].notna()
+    
+    if valid_mask.sum() > 0:
+        y_true = df_pred.loc[valid_mask, 'IS_EVENTUALLY_SUCCESSFUL'].astype(int)
+        y_prob = df_pred.loc[valid_mask, 'SUCCESS_PROBABILITY']
+        
+        auc_score = roc_auc_score(y_true, y_prob)
+        print(f"ROC-AUC Score on New Data: {auc_score:.4f}")
+        print(f"*(Evaluated on {valid_mask.sum():,} resolved rows)*")
+    else:
+        print("Cannot calculate AUC: 'IS_EVENTUALLY_SUCCESSFUL' contains only null values.")
+else:
+    print("Cannot calculate AUC: Target column 'IS_EVENTUALLY_SUCCESSFUL' missing from data.")
 
 #%% Confusion Matrix
 import numpy as np
@@ -467,7 +493,7 @@ y_probs_062025 = df_pred['SUCCESS_PROBABILITY'].values
 
 plot_business_confusion_matrix(y_true=y_true_062025, 
                                y_probs=y_probs_062025, 
-                               threshold=0.15, 
+                               threshold=0.05, 
                                dataset_name="Random Test Set (In-Sample)")
 
 
@@ -540,10 +566,10 @@ print("\nGenerating Order-Level Confusion Matrices...")
 
 # 2. Evaluate the Random Holdout Test Set (In-Sample)
 plot_order_level_confusion_matrix(
-    order_ids=random_test_df['ORDER_ID'].values, 
+    order_ids=df_pred['ORDER_ID'].values, 
     y_true=y_true_062025, 
     y_probs=y_probs_062025, 
-    threshold=0.03, 
+    threshold=0.02, 
     dataset_name="Random Test Set (In-Sample)"
 )
 
@@ -647,7 +673,7 @@ def evaluate_cutoff_thresholds(df_pred, thresholds_to_test, ecltv_max_threshold=
     ecltv_df = cur.fetch_pandas_all()
     
     # 1. Ensure datetime formatting
-    df_pred['TRANSACTION_DATETIME'] = pd.to_datetime(df_pred['TRANSACTION_DATETIME'])
+    df_pred['HISTORICAL_COLLECTED_AMOUNT'] = pd.to_datetime(df_pred['TRANSACTION_DATETIME'])
     
     # 2. Merge predictions with the ECLTV dataframe from Snowflake
     df = pd.merge(df_pred, ecltv_df, on='ORDER_ID', how='left')
@@ -832,6 +858,7 @@ def load_cltv():
 
 def prepare_cutoff_frame(df_pred):
     df = df_pred.copy()
+    df['HISTORICAL_COLLECTED_AMOUNT'] = df['HISTORICAL_COLLECTED_AMOUNT']+1
     df['TRANSACTION_DATETIME'] = pd.to_datetime(df['TRANSACTION_DATETIME'])
     df = df.merge(load_cltv(), on='ORDER_ID', how='left', indicator='_src')
 
@@ -910,13 +937,6 @@ _diff = _ungated.values != _gated
 print(f"\nGate check @0.05: {_diff.sum():,}/{len(_c):,} orders differ, "
       f"${_ungated[_diff].sum():,.0f} at stake. Zero => a failed invoice really does end "
       f"the order, and the gate is redundant.")
-
-# 20 example orders where the gate flips the value (_diff is positional, so use iloc)
-_diff_examples = _c.iloc[_diff][['ORDER_ID', 'IS_EVENTUALLY_SUCCESSFUL',
-                                 'CLTV_360', 'HISTORICAL_COLLECTED_AMOUNT',
-                                 'SUCCESS_PROBABILITY', 'ECLTV_1Y']].head(20)
-print("\n20 example orders that differ:")
-print(_diff_examples.to_string(index=False))
 
 
 #%%
