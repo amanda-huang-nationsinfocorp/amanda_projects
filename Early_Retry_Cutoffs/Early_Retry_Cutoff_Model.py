@@ -218,9 +218,9 @@ stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=tex
 # =====================================================================
 print("Training Base Model...")
 base_model = CatBoostClassifier(
-    iterations=200,
+    iterations=2000,
     learning_rate=0.1,          # Updated Learning Rate
-    depth=6,
+    depth=7,
     task_type="CPU",
     eval_metric='Logloss',
     custom_metric=['AUC'],
