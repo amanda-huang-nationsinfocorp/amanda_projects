@@ -3,7 +3,7 @@
 
 #%% IMPORTS
 
-from networkx import display
+#from network import display
 import pandas as pd
 import numpy as np
 import json
@@ -20,7 +20,7 @@ import pytz
 
 
 url = URL(
-    user='BITEAM',
+    ='BITEAM',
     password='B1sense@22',
     account='YXBYZCG-MVA06208',
     database="DBT_PROD.PUBLIC",
@@ -283,7 +283,8 @@ final AS (
 )
 
 SELECT *
-FROM final;
+FROM final
+;
 '''
 
 
