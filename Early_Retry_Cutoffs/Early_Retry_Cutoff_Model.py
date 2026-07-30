@@ -205,9 +205,9 @@ X_calib, y_calib = calib_df.drop(columns=drop_cols, errors='ignore'), calib_df['
 
 X_random_test, y_random_test = random_test_df.drop(columns=drop_cols, errors='ignore'), random_test_df['IS_EVENTUALLY_SUCCESSFUL']
 X_oot_test,    y_oot_test    = oot_test_df.drop(columns=drop_cols, errors='ignore'),    oot_test_df['IS_EVENTUALLY_SUCCESSFUL']
-
-# =====================================================================
-# 4. Create Memory-Efficient CatBoost Pools
+ 
+# ============================================= ========================
+# 4. Create Memory-Efficient CatBoost Pools 
 # =====================================================================
 print("Building data pools...")
 train_pool = Pool(X_train, y_train, cat_features=cat_features, text_features=text_features)
@@ -219,7 +219,7 @@ stop_pool  = Pool(X_stop,  y_stop,  cat_features=cat_features, text_features=tex
 print("Training Base Model...")
 base_model = CatBoostClassifier(
     iterations=2000,
-    learning_rate=0.1,          # Updated Learning Rate
+    learning_rate=0.1,          # Updated Learning Rate 
     depth=7,
     task_type="CPU",
     eval_metric='Logloss',
@@ -287,7 +287,7 @@ calibrated_model = CalibratedClassifierCV(
 calibrated_model.fit(X_calib, y_calib)
 
 # =====================================================================
-# 8. Final Dual-Evaluation (Random vs. Chronological)
+# 8. Final Dual-Evaluation (Random vs. Chronological). 
 # =====================================================================
 print("\nEvaluating Model on Dual Test Sets...")
 
@@ -515,7 +515,7 @@ def plot_order_level_confusion_matrix(order_ids, y_true, y_probs, threshold=0.05
                    Otherwise (ALL predicted 0), it's a True Negative.
     """
     # 1. Create a temporary dataframe to group predictions by order
-    df = pd.DataFrame({
+    df = pd.DataFrame({ 
         'order_id': order_ids,
         'y_true': y_true,
         'y_pred': (y_probs >= threshold).astype(int)
@@ -554,7 +554,7 @@ def plot_order_level_confusion_matrix(order_ids, y_true, y_probs, threshold=0.05
     plt.tight_layout()
     plt.show()
 
-    # 6. Print the business breakdown
+    # 6. Print the business breakdown 
     print(f"\n--- Order-Level Breakdown: {dataset_name} (Threshold: {threshold}) ---")
     print(f"Total Unique Orders:  {np.sum(cm):,}")
     print(f"True Negatives (TN):  {TN:,} ({cm_percentages[0,0]:.1%}) -> Entire bad order correctly cut off")
