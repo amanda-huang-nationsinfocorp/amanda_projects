@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/usr/local/bin/python3 /private/tmp/claude-502/-Users-amanda-huang-NIC-amanda-projects/221a34a5-5f3e-4dcf-a90a-31ce1dab1fa0/scratchpad/verify_artifact.py)"
+    ]
+  }
+}

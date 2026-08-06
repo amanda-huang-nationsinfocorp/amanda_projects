@@ -1,0 +1,24 @@
+# Pinned scoring environment for the Early Retry Cutoff model.
+#
+# These are the exact versions the model artifact (calibrated_catboost_model.joblib)
+# was trained and saved under. scikit-learn in particular MUST match: the calibrated
+# model is pickled, and loading it under a different sklearn can silently corrupt the
+# CalibratedClassifierCV / IsotonicRegression internals and shift predictions -- which
+# then flips is_cutoff_early decisions with no error raised.
+#
+# On the VM (Python 3.11+; captured on 3.14):
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#   python Early_Retry_Cutoff_Predict.py
+#
+# Captured from the training env on 2026-08-04.
+
+scikit-learn==1.9.0          # MUST match the version that saved the .joblib
+catboost==1.2.10
+snowflake-connector-python==4.6.0
+pandas==3.0.3
+pyarrow==24.0.0              # required by fetch_pandas_all() / write_pandas()
+numpy==2.4.6
+scipy==1.18.0               # scikit-learn / isotonic calibration dependency
+joblib==1.5.3
+pytz==2026.2

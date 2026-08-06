@@ -49,7 +49,7 @@ sampled_df = df
 MATURITY_DAYS = 30
 
 # =====================================================================
-# 1. Base Filtering and Sorting
+# 1. Base Filtering and Sorting 
 # =====================================================================
 sampled_df['LAST_DECLINE_CODE'] = sampled_df['LAST_DECLINE_CODE'].astype(str)
 sampled_df['DECLINE_FAMILY'] = sampled_df['LAST_DECLINE_CODE'].str[0]
@@ -60,7 +60,7 @@ sampled_df['TRANSACTION_DATETIME'] = pd.to_datetime(sampled_df['TRANSACTION_DATE
 sampled_df = sampled_df.sort_values('TRANSACTION_DATETIME').reset_index(drop=True)
 
 # =====================================================================
-# 1b. Invoice resolution timing  
+# 1b. Invoice resolution timing
 # =====================================================================
 
 print("Computing invoice resolution times...")
@@ -69,7 +69,7 @@ invoice_times = sampled_df.groupby('INVOICE_ID', sort=False).agg(
     INVOICE_START=('TRANSACTION_DATETIME', 'min'),
     INVOICE_LAST_TXN=('TRANSACTION_DATETIME', 'max'),
     IS_EVENTUALLY_SUCCESSFUL=('IS_EVENTUALLY_SUCCESSFUL', 'first'),
-)
+) 
 
 first_accept = (
     sampled_df.loc[sampled_df['TRANSACTION_STATUS'] == 'accepted']
@@ -98,7 +98,7 @@ print(f"  {len(sampled_df):,} rows | {sampled_df['INVOICE_ID'].nunique():,} invo
       f"| {sampled_df['ORDER_ID'].nunique():,} orders")
 
 # =======================================================================
-# 2. Data Processing & Pre-Split Vectorized I
+# 2. Data Processing & Pre-Split Vectorized I 
 # =======================================================================
 print("Processing and Imputing Data...")
 drop_cols = ['ORDER_ID', 'INVOICE_ID', 'TRANSACTION_ID', 'TRANSACTION_DATETIME',
@@ -112,7 +112,7 @@ text_features = [col for col in ['SUPER_PARTNER_ID_NAME', 'BANK'] if col in samp
 cat_features = sampled_df.drop(columns=drop_cols, errors='ignore').select_dtypes(include=['object', 'category']).columns.tolist()
 cat_features = [c for c in cat_features if c not in text_features]
 
-# Vectorized Imputation BEFORE the split (Massive speedup)
+# Vectorized Imputation BEFORE the split (Massive speedup) 
 sampled_df[cat_features + text_features] = sampled_df[cat_features + text_features].fillna('unknown').astype(str)
 
 # Get purely numeric feature columns (excluding drops and target)
@@ -120,10 +120,10 @@ numeric_cols = sampled_df.columns.difference(cat_features + text_features + drop
 sampled_df[numeric_cols] = sampled_df[numeric_cols].fillna(-1)
 
 # =====================================================================
-# 3. Hybrid Split (As-Of-Date OOT + Order-Grouped Random)
+# 3. Hybrid Split (As-Of-Date OOT + Order-Grouped Random)  
 # =====================================================================
 # =====================================================================
-# 3. Dynamic Chronological Split (85% Past / 15% Recent OOT)
+# 3. Dynamic Chronological Split (85% Past / 15% Recent OOT)                                                                                                                                     
 # =====================================================================
 print("Splitting data (85% Past / 15% Recent OOT)...")
 
@@ -135,7 +135,6 @@ MATURITY_CUTOFF = MAX_DATE - pd.Timedelta(days=MATURITY_DAYS)
 invoice_elig = sampled_df.groupby('INVOICE_ID', sort=False).agg(
     INVOICE_START=('TRANSACTION_DATETIME', 'min')
 )
-
 # 3. Filter for ONLY completely finished invoices (started at least 30 days ago)
 mature_invoices = invoice_elig[invoice_elig['INVOICE_START'] <= MATURITY_CUTOFF].copy()
 
@@ -143,7 +142,7 @@ mature_invoices = invoice_elig[invoice_elig['INVOICE_START'] <= MATURITY_CUTOFF]
 split_date = mature_invoices['INVOICE_START'].quantile(0.85)
 
 print(f"  Dataset max date: {MAX_DATE.date()}")
-print(f"  Maturity cutoff:  {MATURITY_CUTOFF.date()}")
+print(f"  Maturity cutoff:  {MATURITY_CUTOFF.date()}") 
 print(f"  85/15 Split date: {split_date.date()}")
 
 # 5. Split the mature invoices into Past and OOT based on the split date
@@ -206,7 +205,7 @@ X_calib, y_calib = calib_df.drop(columns=drop_cols, errors='ignore'), calib_df['
 X_random_test, y_random_test = random_test_df.drop(columns=drop_cols, errors='ignore'), random_test_df['IS_EVENTUALLY_SUCCESSFUL']
 X_oot_test,    y_oot_test    = oot_test_df.drop(columns=drop_cols, errors='ignore'),    oot_test_df['IS_EVENTUALLY_SUCCESSFUL']
  
-# ============================================= ========================
+# =====================================================================
 # 4. Create Memory-Efficient CatBoost Pools 
 # =====================================================================
 print("Building data pools...")
@@ -247,7 +246,7 @@ best_iter = base_model.get_best_iteration()
 # Safely locate the validation dictionary key
 val_key = 'validation' if 'validation' in history else 'validation_0'
 
-plt.figure(figsize=(14, 5))
+plt.figure(figsize=(14, 5)) 
 
 # Plot Log Loss
 plt.subplot(1, 2, 1)
@@ -256,11 +255,11 @@ plt.plot(iterations_range, history[val_key]['Logloss'], label='Stop Log Loss', c
 plt.axvline(x=best_iter, color='red', linestyle='--', label=f'Best Iter ({best_iter})')
 plt.title('Log Loss (Overfitting Check)')
 plt.xlabel('Trees (Iterations)')
-plt.ylabel('Log Loss')
+plt.ylabel('Log Loss') 
 plt.legend()
 plt.grid(True)
 
-# Plot ROC-AUC (Fixing the AUC KeyError by ignoring Train AUC)
+# Plot ROC-AUC (Fixing the AUC KeyError by ignoring Train AUC) 
 plt.subplot(1, 2, 2)
 if 'AUC' in history[val_key]:
     plt.plot(iterations_range, history[val_key]['AUC'], label='Stop AUC', color='orange')
@@ -535,7 +534,7 @@ def plot_order_level_confusion_matrix(order_ids, y_true, y_probs, threshold=0.05
     TN = ((grouped['y_true'] == 0) & (~grouped['has_pred_1'])).sum()
 
     # 4. Build the Confusion Matrix array and calculate percentages
-    cm = np.array([[TN, FP], 
+    cm = np.array([[TN, FP],  
                    [FN, TP]])
     cm_percentages = cm / np.sum(cm)
 
