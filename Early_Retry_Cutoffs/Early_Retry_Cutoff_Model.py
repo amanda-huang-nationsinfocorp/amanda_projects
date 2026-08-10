@@ -13,8 +13,8 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 from catboost import CatBoostClassifier
-import os
-import joblib
+import os 
+import joblib 
 from sklearn.frozen import FrozenEstimator
 import matplotlib.pyplot as plt
 from catboost import CatBoostClassifier, Pool
@@ -322,11 +322,11 @@ model_path = os.path.join(script_dir, 'calibrated_catboost_model.joblib')
 # 2. Package the model and the exact feature lists into one dictionary
 # This ensures your prediction script applies the exact same preprocessing
 model_artifact = {
-    'model': calibrated_model,
+    'model': calibrated_model, 
     'cat_features': cat_features,
     'text_features': text_features,
     'drop_cols': drop_cols,
-}
+} 
 
 # 3. Save the artifact to the script's directory
 joblib.dump(model_artifact, model_path)
@@ -460,7 +460,7 @@ def plot_business_confusion_matrix(y_true, y_probs, threshold=0.05, dataset_name
     # Reshape the list of strings back into a 2x2 grid to match the heatmap
     labels = np.asarray(labels).reshape(2, 2)
 
-    # 5. Visualize the Matrix
+    # 5. Visualize the Matrix 
     plt.figure(figsize=(8, 6))
 
     # Notice we changed annot=labels and fmt='' (empty string) so Seaborn accepts our custom text

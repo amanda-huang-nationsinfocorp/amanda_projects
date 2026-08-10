@@ -1,25 +1,19 @@
 """
 Early Retry Cutoff -- batch scoring + write-back to Snowflake.
-
-Standalone operational script. It does NOT retrain -- it reuses the artifact
-saved by Early_Retry_Cutoff_Model.py (calibrated_catboost_model.joblib).
-
 Each run it:
   1. connects to Snowflake,
   2. pulls the scoring data,
   3. loads the trained model + feature lists from the .joblib,
   4. scores every row,
   5. writes ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_PREDICTIONS.
-
-Run with:  python Early_Retry_Cutoff_Predict.py   (inside the pinned env -- see requirements.txt)
 """
 #%% Imports
 import os
 import joblib
 from datetime import datetime
-
 import pytz
-import pandas as pd 
+import numpy as np
+import pandas as pd
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
 
@@ -32,9 +26,10 @@ MODEL_FILE = "calibrated_catboost_model.joblib"
 
 CUTOFF_THRESHOLD = 0.05
 
-# "replace" -> CREATE OR REPLACE each run; the table holds only the latest snapshot.
-# "append"  -> keep history across runs; CUTOFF_DATETIME distinguishes them.
-WRITE_MODE = "replace"
+WRITE_MODE = "append" # "replace" or "append"
+
+# Randomly flag exactly 10% of rows as True (reproducible via seed)
+random_selection = 0.1
 
 TARGET_DB, TARGET_SCHEMA, TARGET_NAME = TARGET_TABLE.split(".")
 
@@ -51,7 +46,25 @@ ctx = snowflake.connector.connect(
 cur = ctx.cursor()
 
 query = f"""
-WITH base_transactions AS (
+WITH
+live_invoices AS (
+    SELECT
+        invoice_id,
+        order_id
+    FROM DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+    WHERE retries IS NOT NULL
+      AND transaction_type IN ('sale', 'capture')
+      AND invoice_type NOT LIKE '%trial%'
+    GROUP BY invoice_id, order_id
+    HAVING MAX(retries) < 30
+       AND MAX(transaction_datetime) >= DATEADD('day', -30, CURRENT_DATE())
+),
+
+live_orders AS (
+    SELECT DISTINCT order_id FROM live_invoices
+),
+
+base_transactions AS (
     SELECT
         orders.transaction_id,
         orders.order_id,
@@ -83,204 +96,263 @@ WITH base_transactions AS (
         orders.retries IS NOT NULL
         AND orders.transaction_type IN ('sale', 'capture')
         AND orders.invoice_type NOT LIKE '%trial%'
-        -- Rolling lower bound so this doesn't scan all history. Must be WIDER than any
-        -- order lifetime you care about, so prior-invoice history is fully retained.
-        AND orders.transaction_datetime >= DATEADD('month', -1, CURRENT_DATE())
-        AND membership_status not in ('expired', 'cancelled', 'trial')
+        AND orders.order_id IN (SELECT order_id FROM live_orders)
 ),
 
-invoice_scope AS (
-    -- Which invoices to SCORE: recently active, not maxed out.
-    SELECT invoice_id
-    FROM base_transactions
-    GROUP BY invoice_id
-    HAVING MAX(retries) < 30
-       AND MAX(transaction_datetime) >= DATEADD('day', -30, CURRENT_DATE())
-),                                             
 invoice_summary AS (
-    SELECT 
-        order_id, 
+    -- 2. Determine the outcome and stats of each full invoice cycle
+    SELECT
+        order_id,
         invoice_id,
         MIN(transaction_datetime) AS invoice_start_time,
         MAX(retries) AS invoice_max_retries,
         MAX(CASE WHEN transaction_status = 'accepted' THEN 1 ELSE 0 END) AS is_eventually_successful,
         MAX(CASE WHEN transaction_status = 'accepted' AND retries = 0 THEN 1 ELSE 0 END) AS is_success_on_retry_0
-    FROM base_transactions  
+    FROM base_transactions
     GROUP BY order_id, invoice_id
 ),
 
 order_history AS (
-    SELECT 
+    -- 3. Calculate historical order stats
+    -- Note: This assumes invoice cycles for a single order do not overlap in time.
+    SELECT
         order_id,
         invoice_id,
         invoice_start_time,
-        SUM(is_eventually_successful) OVER (  
-            PARTITION BY order_id 
-            ORDER BY invoice_start_time 
+
+        -- Total prior successful invoices
+        SUM(is_eventually_successful) OVER (
+            PARTITION BY order_id
+            ORDER BY invoice_start_time
             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
         ) AS prior_successful_invoices,
+
+        -- Last invoice max retry
         LAG(invoice_max_retries) OVER (
-            PARTITION BY order_id 
-            ORDER BY invoice_start_time                           
+            PARTITION BY order_id
+            ORDER BY invoice_start_time
         ) AS last_invoice_retry,
+
+        -- Prep for Dynamic Avg: Sum of past max retries & count of past invoices
         SUM(invoice_max_retries) OVER (
-            PARTITION BY order_id 
-            ORDER BY invoice_start_time 
+            PARTITION BY order_id
+            ORDER BY invoice_start_time
             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
         ) AS sum_past_max_retries,
+
         COUNT(invoice_id) OVER (
-            PARTITION BY order_id 
-            ORDER BY invoice_start_time 
+            PARTITION BY order_id
+            ORDER BY invoice_start_time
             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
         ) AS count_past_invoices,
+
+        -- REVISED Gaps and Islands ID:
+        -- Look at previous invoices. Increment group ID when a prior invoice failed on retry 0.
         COALESCE(
             SUM(CASE WHEN is_success_on_retry_0 = 0 THEN 1 ELSE 0 END) OVER (
-                PARTITION BY order_id 
-                ORDER BY invoice_start_time 
+                PARTITION BY order_id
+                ORDER BY invoice_start_time
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
             ), 0
         ) AS streak_group_id,
+
         is_success_on_retry_0
     FROM invoice_summary
 ),
 
 consecutive_streaks AS (
+    -- 4. Correctly count the streak length WITHOUT nested window functions
     SELECT
         invoice_id,
         prior_successful_invoices,
         last_invoice_retry,
         sum_past_max_retries,
         count_past_invoices,
+
         COALESCE(
             SUM(is_success_on_retry_0) OVER (
-                PARTITION BY order_id, streak_group_id 
-                ORDER BY invoice_start_time 
+                PARTITION BY order_id, streak_group_id
+                ORDER BY invoice_start_time
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-            ), 0 
+            ), 0
         ) AS consecutive_success_retry_0
+
     FROM order_history
-),  
+),
 
 transaction_sequencing AS (
-    SELECT 
+    -- 5. Calculate point-in-time features dynamically updated row-by-row
+    SELECT
         b.*,
         i.is_eventually_successful,
         i.invoice_start_time,
+
         c.prior_successful_invoices,
         c.last_invoice_retry,
         c.consecutive_success_retry_0,
+
+        -- DYNAMIC MAX RETRY: all transactions for this order up to this exact row
         MAX(b.retries) OVER (
-            PARTITION BY b.order_id 
-            ORDER BY b.transaction_datetime 
+            PARTITION BY b.order_id
+            ORDER BY b.transaction_datetime
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS max_retry_in_order,
-        (COALESCE(c.sum_past_max_retries, 0) + b.retries) / 
+
+        -- DYNAMIC AVG RETRY: (sum of past invoices' max retries + current row's retry) / total invoices
+        (COALESCE(c.sum_past_max_retries, 0) + b.retries) /
         (COALESCE(c.count_past_invoices, 0) + 1.0) AS avg_retry_in_order,
+
         LAG(b.transaction_datetime) OVER (
-            PARTITION BY b.invoice_id 
-            ORDER BY b.retries 
+            PARTITION BY b.invoice_id
+            ORDER BY b.retries
         ) AS last_failure_datetime,
+
         LAG(b.decline_code) OVER (
-            PARTITION BY b.invoice_id 
+            PARTITION BY b.invoice_id
             ORDER BY b.retries
         ) AS last_decline_code_raw,
+
+        -- Identical definition to training: non-trial accepted $ on the order,
+        -- strictly before this attempt. Correct here because base_transactions
+        -- carries the WHOLE order.
         COALESCE(
             SUM(CASE WHEN b.transaction_status = 'accepted' THEN b.transaction_amount ELSE 0 END) OVER (
-                PARTITION BY b.order_id 
-                ORDER BY b.transaction_datetime 
+                PARTITION BY b.order_id
+                ORDER BY b.transaction_datetime
                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
             ), 0
         ) AS historical_collected_amount,
+
+        -- Rolling 8 Days Avg Success Rate per Super Partner
         SUM(CASE WHEN b.transaction_status = 'accepted' THEN 1 ELSE 0 END) OVER (
-            PARTITION BY b.super_partner_id_name 
-            ORDER BY b.transaction_datetime 
+            PARTITION BY b.super_partner_id_name
+            ORDER BY b.transaction_datetime
             RANGE BETWEEN INTERVAL '8 DAYS' PRECEDING AND INTERVAL '1 SECOND' PRECEDING
-        ) / 
+        ) /
         NULLIF(COUNT(*) OVER (
-            PARTITION BY b.super_partner_id_name 
-            ORDER BY b.transaction_datetime 
+            PARTITION BY b.super_partner_id_name
+            ORDER BY b.transaction_datetime
             RANGE BETWEEN INTERVAL '8 DAYS' PRECEDING AND INTERVAL '1 SECOND' PRECEDING
-        ), 0) AS super_partner_8d_success_rate, 
+        ), 0) AS super_partner_8d_success_rate,
+
+        -- Rolling 8 Days Avg Success Rate per Processor Original
         SUM(CASE WHEN b.transaction_status = 'accepted' THEN 1 ELSE 0 END) OVER (
-            PARTITION BY b.processor_name_original 
-            ORDER BY b.transaction_datetime 
+            PARTITION BY b.processor_name_original
+            ORDER BY b.transaction_datetime
             RANGE BETWEEN INTERVAL '8 DAYS' PRECEDING AND INTERVAL '1 SECOND' PRECEDING
-        ) / 
+        ) /
         NULLIF(COUNT(*) OVER (
-            PARTITION BY b.processor_name_original 
-            ORDER BY b.transaction_datetime 
+            PARTITION BY b.processor_name_original
+            ORDER BY b.transaction_datetime
             RANGE BETWEEN INTERVAL '8 DAYS' PRECEDING AND INTERVAL '1 SECOND' PRECEDING
         ), 0) AS processor_8d_success_rate,
+
+        -- Rolling 8 Days Avg Success Rate per Bank
         SUM(CASE WHEN b.transaction_status = 'accepted' THEN 1 ELSE 0 END) OVER (
-            PARTITION BY b.bank 
-            ORDER BY b.transaction_datetime 
+            PARTITION BY b.bank
+            ORDER BY b.transaction_datetime
             RANGE BETWEEN INTERVAL '8 DAYS' PRECEDING AND INTERVAL '1 SECOND' PRECEDING
-        ) / 
-        NULLIF(COUNT(*) OVER (  
-            PARTITION BY b.bank 
-            ORDER BY b.transaction_datetime 
+        ) /
+        NULLIF(COUNT(*) OVER (
+            PARTITION BY b.bank
+            ORDER BY b.transaction_datetime
             RANGE BETWEEN INTERVAL '8 DAYS' PRECEDING AND INTERVAL '1 SECOND' PRECEDING
         ), 0) AS bank_8d_success_rate
+
     FROM base_transactions b
     JOIN invoice_summary i ON b.invoice_id = i.invoice_id
     JOIN consecutive_streaks c ON b.invoice_id = c.invoice_id
-), 
+),
 
-final AS (
-    SELECT 
-        t.order_id,
-        t.invoice_id,
-        t.transaction_id,
-        t.transaction_datetime,  
-        invoice_sequence AS invoice_number,
-        t.retries,
-        t.transaction_status,   
-        COALESCE(t.vertical_type, 'unknown') AS vertical_type,
-        COALESCE(t.super_partner_id_name, 'unknown') AS super_partner_id_name,
-        case when SPLIT(processor_name_original , '-')[1] like '%TRX%' then 'NMI'  
-        when SPLIT(processor_name_original , '-')[1] like '%ADYEN%' then 'ADYEN'
-        else 'Others' 
-        end as processor_type,
-        COALESCE(t.bin_tier, 'unknown') AS bin_tier,
-        COALESCE(t.card_type, 'unknown') AS card_type,
-        COALESCE(t.bank, 'unknown') AS bank,   
-        COALESCE(t.billing_state, 'unknown') AS billing_state,
-        COALESCE(t.offer_amount, -1) AS offer_amount,
-        COALESCE(t.transaction_amount, -1) AS transaction_amount, 
-        COALESCE(t.payment_frequency, 'unknown') AS payment_frequency,
-        COALESCE(t.offer_minus_payment, -1) AS offer_minus_payment,
-        COALESCE(t.last_decline_code_raw, 'unknown') AS last_decline_code,
-        COALESCE(t.invoice_type, 'unknown') AS invoice_type, 
-        COALESCE(t.max_retry_in_order, -1) AS max_retry_in_order,
-        COALESCE(t.avg_retry_in_order, -1) AS avg_retry_in_order,
-        COALESCE(t.last_invoice_retry, -1) AS last_invoice_retry,  
-        COALESCE(t.prior_successful_invoices, -1) AS prior_successful_invoice_count,
-        COALESCE(t.consecutive_success_retry_0, -1) AS consecutive_success_retry_0,  
-        t.historical_collected_amount,
-        COALESCE(DATEDIFF('day', t.invoice_start_time, t.transaction_datetime), -1) AS days_since_initial_failure,
-        COALESCE(DATEDIFF('day', t.last_failure_datetime, t.transaction_datetime), -1) AS days_since_last_failure,
-        DAYOFWEEK(t.transaction_datetime) AS retry_day_of_week,
-        DAY(t.transaction_datetime) AS retry_day_of_month,
-        HOUR(t.transaction_datetime) AS retry_hour,
-        COALESCE(t.super_partner_8d_success_rate, -1) AS super_partner_8d_success_rate,
-        COALESCE(t.processor_8d_success_rate, -1) AS processor_8d_success_rate,
-        COALESCE(t.bank_8d_success_rate, -1) AS bank_8d_success_rate,
-        -- NOT a real label on live data: this is "accepted so far", which is 0 for
-        -- every currently-declining invoice. Kept only so the schema matches training
-        -- (the scoring script drops it). Do NOT run the AUC / confusion blocks against it.
-        t.is_eventually_successful
+trial_money AS (
+    SELECT
+        order_id,
+        SUM(CASE WHEN transaction_status = 'accepted' THEN transaction_amount ELSE 0 END) AS trial_collected_amount
+    FROM DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
+    WHERE order_id IN (SELECT order_id FROM live_orders)
+      AND invoice_type LIKE '%trial%'
+    GROUP BY order_id
+),
+
+-- =====================================================================
+-- Keep only LIVE invoices, one row each = the most recent attempt.
+-- =====================================================================
+scored AS (
+    SELECT t.*
     FROM transaction_sequencing t
-    JOIN invoice_scope sc ON sc.invoice_id = t.invoice_id     -- CHANGED: scope restricts OUTPUT here, not feature context
+    JOIN live_invoices li ON li.invoice_id = t.invoice_id
     QUALIFY ROW_NUMBER() OVER (
         PARTITION BY t.invoice_id
         ORDER BY t.transaction_datetime DESC, t.transaction_id DESC
     ) = 1
-    AND t.transaction_status <> 'accepted'    -- optional: only score invoices whose latest attempt is a decline (delete to keep all)
+),
+
+-- 6. Final Selection & Imputation Handling
+final AS (
+    SELECT
+        s.order_id,
+        s.invoice_id,
+        s.transaction_id,
+        s.transaction_datetime,
+        s.invoice_sequence AS invoice_number,
+        s.retries,
+        s.transaction_status,
+        COALESCE(s.vertical_type, 'unknown') AS vertical_type,
+        COALESCE(s.super_partner_id_name, 'unknown') AS super_partner_id_name,
+        CASE WHEN SPLIT(s.processor_name_original, '-')[1] LIKE '%TRX%' THEN 'NMI'
+             WHEN SPLIT(s.processor_name_original, '-')[1] LIKE '%ADYEN%' THEN 'ADYEN'
+             ELSE 'Others'
+        END AS processor_type,
+        COALESCE(s.bin_tier, 'unknown') AS bin_tier,
+        COALESCE(s.card_type, 'unknown') AS card_type,
+        COALESCE(s.bank, 'unknown') AS bank,
+        COALESCE(s.billing_state, 'unknown') AS billing_state,
+        COALESCE(s.offer_amount, -1) AS offer_amount,
+        COALESCE(s.transaction_amount, -1) AS transaction_amount,
+        COALESCE(s.payment_frequency, 'unknown') AS payment_frequency,
+        COALESCE(s.offer_minus_payment, -1) AS offer_minus_payment,
+        COALESCE(s.last_decline_code_raw, 'unknown') AS last_decline_code,
+        COALESCE(s.invoice_type, 'unknown') AS invoice_type,
+
+        -- Historical & Dynamic Order Features
+        COALESCE(s.max_retry_in_order, -1) AS max_retry_in_order,
+        COALESCE(s.avg_retry_in_order, -1) AS avg_retry_in_order,
+        COALESCE(s.last_invoice_retry, -1) AS last_invoice_retry,
+        COALESCE(s.prior_successful_invoices, -1) AS prior_successful_invoice_count,
+        COALESCE(s.consecutive_success_retry_0, -1) AS consecutive_success_retry_0,
+        s.historical_collected_amount,
+ 
+        -- Temporal Point-in-Time Features
+        COALESCE(DATEDIFF('day', s.invoice_start_time, s.transaction_datetime), -1) AS days_since_initial_failure,
+        COALESCE(DATEDIFF('day', s.last_failure_datetime, s.transaction_datetime), -1) AS days_since_last_failure,
+        DAYOFWEEK(s.transaction_datetime) AS retry_day_of_week,
+        DAY(s.transaction_datetime) AS retry_day_of_month,
+        HOUR(s.transaction_datetime) AS retry_hour,
+
+        -- Rolling Context Features
+        COALESCE(s.super_partner_8d_success_rate, -1) AS super_partner_8d_success_rate,
+        COALESCE(s.processor_8d_success_rate, -1) AS processor_8d_success_rate,
+        COALESCE(s.bank_8d_success_rate, -1) AS bank_8d_success_rate,
+
+        -- Eval-only (model ignores it)
+        COALESCE(tm.trial_collected_amount, 0) AS trial_collected_amount,
+
+        -- Target column kept for schema parity ONLY. On live data this is
+        -- "accepted so far" = 0 for every declining invoice, NOT a usable label.
+        -- Do not run the .py AUC / confusion blocks against it (single class -> error).
+        s.is_eventually_successful 
+ 
+    FROM scored s
+    LEFT JOIN trial_money tm ON tm.order_id = s.order_id
+    -- Only invoices currently in a declined state are cuttable. Delete this line
+    -- to keep every live invoice (e.g. for monitoring).
+    WHERE s.transaction_status <> 'accepted'
 )
 
 SELECT * FROM final
-ORDER BY order_id, invoice_id, retries        
-;
+ORDER BY order_id, invoice_id, retries
+;      
+
 """
 
 cur.execute("use database dbt_prod")
@@ -299,7 +371,7 @@ if missing_out:
 script_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(script_dir, MODEL_FILE)
 print(f"Loading model artifact from {model_path} ...")
-artifact = joblib.load(model_path)
+artifact = joblib.load(model_path) 
 calibrated_model = artifact["model"]
 cat_features = artifact["cat_features"]
 text_features = artifact["text_features"]
@@ -350,11 +422,6 @@ success_prob = calibrated_model.predict_proba(X_new)[:, 1]
 # ============================================================================
 # 6. Assemble the output table
 # ============================================================================
-# Pacific wall-clock time of this run (PST/PDT), formatted as an ISO STRING on purpose.
-# write_pandas (snowflake-connector 4.6.0 + pandas 3.0) mis-scales real datetime columns
-# -- it hands Snowflake the raw int64 as if it were epoch-seconds, producing garbage
-# "year 56,000,000" timestamps (this was the "invalid date" bug). Passing a string lets
-# Snowflake implicitly cast it into the TIMESTAMP_NTZ column correctly.
 run_ts_pst = datetime.now(pytz.timezone("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 out = pd.DataFrame({
@@ -366,6 +433,11 @@ out = pd.DataFrame({
     "CUT_OFF_AT_RETRY": df_pred["RETRIES"].values,
     "CURRENT_CLTV":     df_pred["HISTORICAL_COLLECTED_AMOUNT"].values,
 })
+
+n_random = int(len(out) * random_selection)
+random_mask = np.zeros(len(out), dtype=bool)
+random_mask[np.random.default_rng(42).choice(len(out), size=n_random, replace=False)] = True
+out["RANDOM_SELECTION"] = random_mask
 
 print(f"  {int(out['IS_CUTOFF_EARLY'].sum()):,} / {len(out):,} rows flagged "
       f"is_cutoff_early (P(success) < {CUTOFF_THRESHOLD})")
@@ -381,7 +453,8 @@ CREATE {{verb}} {TARGET_TABLE} (
     IS_CUTOFF_EARLY   BOOLEAN,
     CUTOFF_DATETIME   TIMESTAMP_NTZ,
     CUT_OFF_AT_RETRY  NUMBER,
-    CURRENT_CLTV      FLOAT
+    CURRENT_CLTV      FLOAT,
+    RANDOM_SELECTION  BOOLEAN
 )
 """
 
