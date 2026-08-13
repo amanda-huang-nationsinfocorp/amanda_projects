@@ -55,9 +55,11 @@ live_invoices AS (
     WHERE retries IS NOT NULL
       AND transaction_type IN ('sale', 'capture')
       AND invoice_type NOT LIKE '%trial%'
+      AND membership_status NOT IN ('cancelled', 'expired')
     GROUP BY invoice_id, order_id
     HAVING MAX(retries) < 30
        AND MAX(transaction_datetime) >= DATEADD('day', -30, CURRENT_DATE())
+       
 ),
 
 live_orders AS (
@@ -371,7 +373,7 @@ if missing_out:
 script_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(script_dir, MODEL_FILE)
 print(f"Loading model artifact from {model_path} ...")
-artifact = joblib.load(model_path) 
+artifact = joblib.load(model_path)  
 calibrated_model = artifact["model"]
 cat_features = artifact["cat_features"]
 text_features = artifact["text_features"]
@@ -381,13 +383,13 @@ drop_cols = artifact["drop_cols"]
 # 4. Preprocess EXACTLY as in Early_Retry_Cutoff_Model.py's prediction cell
 # ============================================================================
 print("Preprocessing ...")
-if "LAST_DECLINE_CODE" in df_pred.columns:
+if "LAST_DECLINE_CODE" in df_pred.columns: 
     df_pred["LAST_DECLINE_CODE"] = df_pred["LAST_DECLINE_CODE"].astype(str)
     df_pred["DECLINE_FAMILY"] = df_pred["LAST_DECLINE_CODE"].str[0]
 
 X_new = df_pred.drop(columns=drop_cols, errors="ignore").copy()
 
-# Categorical / text imputation
+# Categorical / text imputation 
 existing_cat_text = [c for c in (cat_features + text_features) if c in X_new.columns]
 if existing_cat_text:
     X_new[existing_cat_text] = X_new[existing_cat_text].fillna("unknown").astype(str)
@@ -401,7 +403,7 @@ if len(numeric_cols) > 0:
 if hasattr(calibrated_model, "calibrated_classifiers_"):
     base_wrapper = calibrated_model.calibrated_classifiers_[0].estimator
 else:
-    base_wrapper = calibrated_model.estimator
+    base_wrapper = calibrated_model.estimator 
 actual_catboost = getattr(base_wrapper, "estimator", getattr(base_wrapper, "model", base_wrapper))
 feature_names = actual_catboost.feature_names_
 
@@ -414,7 +416,7 @@ if missing_feats:
 X_new = X_new[feature_names]
 
 # ============================================================================
-# 5. Predict
+# 5. Predict  
 # ============================================================================
 print("Scoring ...")
 success_prob = calibrated_model.predict_proba(X_new)[:, 1]
@@ -443,7 +445,7 @@ print(f"  {int(out['IS_CUTOFF_EARLY'].sum()):,} / {len(out):,} rows flagged "
       f"is_cutoff_early (P(success) < {CUTOFF_THRESHOLD})")
 
 # ============================================================================
-# 7. Write to Snowflake
+# 7. Write to Snowflake  
 # ============================================================================
 DDL = f"""
 CREATE {{verb}} {TARGET_TABLE} (
@@ -466,7 +468,7 @@ else:  # append -- create only if it doesn't exist yet
     cur.execute(DDL.format(verb="TABLE IF NOT EXISTS"))
 
 success, n_chunks, n_rows, _ = write_pandas(
-    ctx, out,
+    ctx, out, 
     table_name=TARGET_NAME,
     database=TARGET_DB,
     schema=TARGET_SCHEMA,

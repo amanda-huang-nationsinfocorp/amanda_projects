@@ -117,7 +117,7 @@ print("Splitting data (85% Past / 15% Recent OOT)...")
 # 1. Determine the maximum date in the dataset to calculate maturity
 MAX_DATE = sampled_df['TRANSACTION_DATETIME'].max()
 MATURITY_CUTOFF = MAX_DATE - pd.Timedelta(days=MATURITY_DAYS)
-
+ 
 # 2. Get invoice-level start times
 invoice_elig = sampled_df.groupby('INVOICE_ID', sort=False).agg(
     INVOICE_START=('TRANSACTION_DATETIME', 'min')
