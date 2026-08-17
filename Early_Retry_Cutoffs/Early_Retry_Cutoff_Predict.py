@@ -28,8 +28,8 @@ CUTOFF_THRESHOLD = 0.05
 
 WRITE_MODE = "append" # "replace" or "append"
 
-# Randomly flag exactly 10% of rows as True (reproducible via seed)
-random_selection = 0.1
+# Randomly flag exactly 15% of rows as True (reproducible via seed)
+random_selection = 0.12
 
 TARGET_DB, TARGET_SCHEMA, TARGET_NAME = TARGET_TABLE.split(".")
 
@@ -56,6 +56,7 @@ live_invoices AS (
       AND transaction_type IN ('sale', 'capture')
       AND invoice_type NOT LIKE '%trial%'
       AND membership_status NOT IN ('cancelled', 'expired')
+      and order_date >= '2026-08-06'
     GROUP BY invoice_id, order_id
     HAVING MAX(retries) < 30
        AND MAX(transaction_datetime) >= DATEADD('day', -30, CURRENT_DATE())
@@ -70,7 +71,7 @@ base_transactions AS (
     SELECT
         orders.transaction_id,
         orders.order_id,
-        orders.invoice_id,
+        orders.invoice_id, 
         orders.transaction_datetime,
         orders.transaction_status,
         orders.retries,
@@ -83,7 +84,7 @@ base_transactions AS (
         orders.billing_state,
         orders.offer_amount,
         orders.transaction_amount,
-        orders.payment_frequency,
+        orders.payment_frequency,  
         (orders.offer_amount - orders.transaction_amount) AS offer_minus_payment,
         orders.response_code AS decline_code,
         orders.invoice_type,
@@ -158,7 +159,7 @@ order_history AS (
             ), 0
         ) AS streak_group_id,
 
-        is_success_on_retry_0
+        is_success_on_retry_0 
     FROM invoice_summary
 ),
 
@@ -189,7 +190,7 @@ transaction_sequencing AS (
         i.is_eventually_successful,
         i.invoice_start_time,
 
-        c.prior_successful_invoices,
+        c.prior_successful_invoices, 
         c.last_invoice_retry,
         c.consecutive_success_retry_0,
 
@@ -212,7 +213,7 @@ transaction_sequencing AS (
         LAG(b.decline_code) OVER (
             PARTITION BY b.invoice_id
             ORDER BY b.retries
-        ) AS last_decline_code_raw,
+        ) AS last_decline_code_raw, 
 
         -- Identical definition to training: non-trial accepted $ on the order,
         -- strictly before this attempt. Correct here because base_transactions
