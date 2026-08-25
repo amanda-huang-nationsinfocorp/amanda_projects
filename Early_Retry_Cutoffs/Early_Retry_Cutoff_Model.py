@@ -437,19 +437,19 @@ else:
 
 #%% Confusion Matrix
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt 
 import seaborn as sns 
 from sklearn.metrics import confusion_matrix
 
 def plot_business_confusion_matrix(y_true, y_probs, threshold=0.05, dataset_name="Test Set"):
     """
     Evaluates business impact based on model predictions and a given threshold.
-    """
+    """ 
     # 2. Convert probabilities to hard predictions
     y_pred = (y_probs >= threshold).astype(int)
 
     # 3. Calculate the Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred) 
 
     # 4. Calculate Percentages and Create Custom Labels ugk 
     # Divide each cell by the total number of predictions to get the % of total
@@ -474,7 +474,7 @@ def plot_business_confusion_matrix(y_true, y_probs, threshold=0.05, dataset_name
     plt.tight_layout()
     plt.show()
 
-    # 6. Print the business breakdown
+    # 6. Print the business breakdown 
     tn, fp, fn, tp = cm.ravel()
     print(f"\n--- Confusion Matrix Breakdown: {dataset_name} (Threshold: {threshold}) ---")
     print(f"True Negatives (TN):  {tn:,} ({cm_percentages[0,0]:.1%}) -> Correctly cut off")
@@ -956,281 +956,100 @@ print(f"\nGate check @0.05: {_diff.sum():,}/{len(_c):,} orders differ, "
       f"the order, and the gate is redundant.")
 
 
-
-#%%
-#%% Ablation: which change moved the number?
-# Starts from YOUR original calculation and applies my changes one at a time.
-# The "Delta Net" column is the damage (or credit) attributable to that one change.
-
-import pandas as pd
+#%% Qualitative profile: what makes a True Negative (correctly cut off) @ 0.05 distinctive?
+# ---------------------------------------------------------------------------
+# TN == the confusion-matrix "Correctly cut off" cell: the model said STOP
+# (SUCCESS_PROBABILITY < 0.05) AND the invoice really failed (IS_EVENTUALLY_SUCCESSFUL == 0).
+# Goal: describe *what kind* of invoice we're cancelling by finding the feature
+# values that separate these rows from everything else. (Rows are transactions --
+# same granularity as the confusion matrix. A -1 in a numeric feature means "missing".)
 import numpy as np
-
-RETRY_COST = 0.1
-THRESHOLD = 0.05     # ablate at one fixed threshold
-ECLTV_CAP = 20
-
-
-def load_cltv(dedupe):
-    """dedupe=False reproduces your original ecltv CTE (no GROUP BY)."""
-    ecltv_cte = ("select order_id, max(cltv_pred_mean) as ecltv_1y "
-                 "from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER group by 1") if dedupe else \
-                ("select order_id, cltv_pred_mean as ecltv_1y "
-                 "from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER")
-    cur = ctx.cursor()
-    cur.execute(f"""
-    with ecltv as ({ecltv_cte}),
-    tb as (
-        select order_id,
-               div0(sum(case when is_sale = 1 and is_daydiff_interval_txn_order_0360
-                             then transaction_amount else 0 end),
-                    count(distinct case when is_m0 = 1 and is_daydiff_interval_txn_order_0360
-                                        then order_id else null end)) as cltv_360,
-               max(ecltv_1y) as ecltv_1y
-        from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
-        left join ecltv using (order_id)
-        where order_date >= '2025-06-01' and order_date < '2025-07-01' and is_m0 = 1
-        group by 1
-    )
-    select * from tb
-    """)
-    return cur.fetch_pandas_all()
-
-
-def build(df_pred, cltv_df):
-    df = df_pred.copy()
-    df['TRANSACTION_DATETIME'] = pd.to_datetime(df['TRANSACTION_DATETIME'])
-    df = df.merge(cltv_df, on='ORDER_ID', how='left', indicator='_src')
-    df['NEVER_M0'] = df['_src'] == 'left_only'      # absent from tb => never signed up
-    df = df.drop(columns='_src').sort_values(['ORDER_ID', 'TRANSACTION_DATETIME'])
-    df['ORDER_MAX_RETRY'] = df.groupby('ORDER_ID')['RETRIES'].transform('max')
-    df['ORDER_ATTEMPTS_SAVED'] = (df.groupby('ORDER_ID')['TRANSACTION_ID'].transform('size')
-                                  - df.groupby('ORDER_ID').cumcount())
-    return df
-
-
-def score(df, fill0, clip, gate, gain_mode, plus1):
-    d = df.copy()
-    if fill0:
-        # your version: every missing CLTV becomes 0, including paying customers
-        d['ECLTV_1Y'] = d['ECLTV_1Y'].fillna(0)
-        d['CLTV_360'] = d['CLTV_360'].fillna(0)
-    else:
-        # mine: never-M0 are true zeros; made-M0-but-no-eCLTV stay NaN -> never cut
-        d.loc[d['NEVER_M0'], ['CLTV_360', 'ECLTV_1Y']] = 0.0
-
-    cut = (d[(d['SUCCESS_PROBABILITY'] < THRESHOLD) & (d['ECLTV_1Y'] < ECLTV_CAP)]
-           .drop_duplicates('ORDER_ID', keep='first').copy())
-
-    if gain_mode == 'attempts':
-        cut['gain'] = cut['ORDER_ATTEMPTS_SAVED'] * RETRY_COST   # pre-attempt by construction
-    else:
-        cut['gain'] = (cut['ORDER_MAX_RETRY'] - cut['RETRIES'] + int(plus1)) * RETRY_COST
-
-    loss = cut['CLTV_360'] - cut['HISTORICAL_COLLECTED_AMOUNT']
-    if clip:
-        loss = loss.clip(lower=0)
-    if gate:
-        loss = loss.where(cut['IS_EVENTUALLY_SUCCESSFUL'] == 1, 0.0)
-    cut['loss'] = loss
-    cut['net'] = cut['gain'] - cut['loss']
-    return cut
-
-
-# --- Pre-flight: are the ingredients even in play? ---------------------------
-cur = ctx.cursor()
-cur.execute("""select count(*) as dupe_orders from (
-                 select order_id from DBT_PROD.ANALYTICS.FCT_ECLTV_ORDER
-                 group by 1 having count(*) > 1)""")
-dupes = cur.fetch_pandas_all().iloc[0, 0]
-
-cltv_dedup = load_cltv(dedupe=True)
-cltv_raw = load_cltv(dedupe=False)
-base_dedup = build(df_pred, cltv_dedup)
-base_raw = build(df_pred, cltv_raw)
-
-n_orders = base_dedup['ORDER_ID'].nunique()
-never_m0 = base_dedup.loc[base_dedup['NEVER_M0'], 'ORDER_ID'].nunique()
-no_ecltv = base_dedup.loc[base_dedup['ECLTV_1Y'].isna() & ~base_dedup['NEVER_M0'], 'ORDER_ID'].nunique()
-multi_inv = (base_dedup.groupby('ORDER_ID')['INVOICE_ID'].nunique() > 1).mean()
-
-print("=" * 76)
-print("PRE-FLIGHT -- how much can each change possibly matter?")
-print("=" * 76)
-print(f"  orders in FCT_ECLTV_ORDER with >1 row : {dupes:,}   <- if 0, the SQL dedupe is a no-op")
-print(f"  orders that never made M0             : {never_m0:,} / {n_orders:,} ({never_m0/n_orders:.1%})")
-print(f"    -> we AGREE on these (loss truly 0)")
-print(f"  orders made M0 but no eCLTV row       : {no_ecltv:,} / {n_orders:,} ({no_ecltv/n_orders:.1%})")
-print(f"    -> your fillna(0) marks these free to cut; I refuse to cut them")
-print(f"  orders with >1 invoice                : {multi_inv:.1%}")
-print(f"    -> only these can make the GAIN formulas diverge")
-
-# --- Cumulative ablation -----------------------------------------------------
-STEPS = [
-    ('0. your original',              dict(dedupe=False, fill0=True,  clip=False, gate=True,  gain_mode='order_max', plus1=False)),
-    ('1. + dedupe ecltv (SQL)',       dict(dedupe=True,  fill0=True,  clip=False, gate=True,  gain_mode='order_max', plus1=False)),
-    ('2. + split the two NaN cases',  dict(dedupe=True,  fill0=False, clip=False, gate=True,  gain_mode='order_max', plus1=False)),
-    ('3. + clip loss at 0',           dict(dedupe=True,  fill0=False, clip=True,  gate=True,  gain_mode='order_max', plus1=False)),
-    ('4. + drop success gate',        dict(dedupe=True,  fill0=False, clip=True,  gate=False, gain_mode='order_max', plus1=False)),
-    ('5. + pre-attempt (+1)',         dict(dedupe=True,  fill0=False, clip=True,  gate=False, gain_mode='order_max', plus1=True)),
-    ('6. + count order-wide attempts', dict(dedupe=True, fill0=False, clip=True,  gate=False, gain_mode='attempts',  plus1=True)),
-]
-
-rows, prev_net = [], None
-for label, cfg in STEPS:
-    base = base_dedup if cfg.pop('dedupe') else base_raw
-    cut = score(base, **cfg)
-    net = cut['net'].sum()
-    rows.append({
-        'Step': label,
-        'Orders Cut': len(cut),
-        'Gain': round(cut['gain'].sum(), 2),
-        'Loss': round(cut['loss'].sum(), 2),
-        'Net': round(net, 2),
-        'Delta Net': '' if prev_net is None else round(net - prev_net, 2),
-    })
-    prev_net = net
-
-ablation = pd.DataFrame(rows)
-print("\n" + "=" * 76)
-print(f"CUMULATIVE ABLATION  (threshold {THRESHOLD}, ECLTV cap {ECLTV_CAP})")
-print("=" * 76)
-print(ablation.to_string(index=False))
-print("\n  Row 0 = your number. Row 6 = mine. The biggest |Delta Net| is your answer.")
-
-# --- Where exactly does the gain diverge? ------------------------------------
-final = score(base_dedup, fill0=False, clip=True, gate=False, gain_mode='attempts', plus1=True)
-final['gain_yours'] = (final['ORDER_MAX_RETRY'] - final['RETRIES']) * RETRY_COST
-final['n_invoices'] = final['ORDER_ID'].map(base_dedup.groupby('ORDER_ID')['INVOICE_ID'].nunique())
-final['gain_diff'] = final['gain'] - final['gain_yours']
-
-print("\n" + "=" * 76)
-print("GAIN DIVERGENCE BY INVOICE COUNT")
-print("=" * 76)
-by_inv = final.groupby(final['n_invoices'].clip(upper=4)).agg(
-    orders=('gain', 'size'), yours=('gain_yours', 'mean'),
-    mine=('gain', 'mean'), total_diff=('gain_diff', 'sum'))
-by_inv['ratio'] = (by_inv['mine'] / by_inv['yours']).round(2)
-print(by_inv.round(2).to_string())
-print("\n  Single-invoice orders should be ~1.0x (only the +1 differs).")
-print("  Multi-invoice orders diverge because retry numbers restart at 0 each invoice,")
-print("  so 'max retry - current retry' cannot see the invoices cancelling also kills.")
-
-#%%
-#%% False negatives + never-M0 investigation
-# Add FUTURE_SUCCESS inside prepare_cutoff_frame, right after ORDER_ATTEMPTS_SAVED:
-#
-#     rev = df.iloc[::-1]
-#     df['FUTURE_SUCCESS'] = rev.groupby('ORDER_ID')['IS_EVENTUALLY_SUCCESSFUL'].cummax().iloc[::-1]
-#
-# Cutting kills the whole order, so every invoice at or after this row dies with it.
-# If any of them would have collected, the order was cut prematurely => false negative.
-#
-# And in _score, after 'Orders Cut':
-#
-#     'False Negatives': int((cut['FUTURE_SUCCESS'] == 1).sum()),
-#     'FN Rate': f"{(cut['FUTURE_SUCCESS'] == 1).mean():.1%}",
-
 import pandas as pd
-import numpy as np
+import matplotlib.pyplot as plt
 
-# =============================================================================
-# Which never-M0 orders collected money, and why?
-# =============================================================================
-never = cutoff_df[cutoff_df['NEVER_M0']]
-# > 1, not > 0: the +1 offset in prepare_cutoff_frame makes a true $0 order read $1.
-collected = (never.groupby('ORDER_ID')['HISTORICAL_COLLECTED_AMOUNT'].max()
-                  .loc[lambda s: s > 1].sort_values(ascending=False))
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 200)
 
-n_never = never['ORDER_ID'].nunique()
-print("=" * 78)
-print("NEVER-M0 ORDERS THAT COLLECTED MONEY")
-print("=" * 78)
-print(f"  never-M0 orders          : {n_never:,}")
-print(f"  ...that collected > $0   : {len(collected):,} ({len(collected)/n_never:.2%})")
-print(f"  total collected by them  : ${collected.sum():,.2f}")
-print(f"\n  Every one of these is being cut with loss forced to $0.\n")
-print(collected.head(20).to_string())
+TN_THRESHOLD = 0.05
+tn_mask   = (df_pred['SUCCESS_PROBABILITY'] < TN_THRESHOLD)
+rest_mask = ~tn_mask
+tn, rest  = df_pred[tn_mask], df_pred[rest_mask]
+n_tn, n_rest = len(tn), len(rest)
+assert n_tn > 0 and n_rest > 0, "No True Negatives (or no 'rest') at 0.05 -- nothing to profile."
 
-# =============================================================================
-# THE DECIDER -- are they really non-M0, or did the June date filter drop them?
-#
-# load_cltv() filters `order_date >= '2025-06-01' and order_date < '2025-07-01'`.
-# An order that DID make M0 but whose order_date falls outside June is ALSO absent
-# from tb -- and my merge indicator marks it 'left_only' exactly like a true non-M0
-# order. NEVER_M0 conflates the two. If is_m0=1 comes back below, that is the bug.
-# =============================================================================
-if len(collected):
-    ids = ','.join(str(i) for i in collected.head(50).index)
-    cur = ctx.cursor()
-    cur.execute(f"""
-    select order_id,
-           max(is_m0)                                   as is_m0,
-           min(order_date)                              as order_date,
-           count(*)                                     as txns,
-           sum(iff(transaction_status='accepted',1,0))  as accepted_txns,
-           round(sum(iff(transaction_status='accepted', transaction_amount, 0)),2) as collected
-    from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
-    where order_id in ({ids})
-    group by 1
-    order by collected desc
-    """)
-    src = cur.fetch_pandas_all()
-    print("\n" + "=" * 78)
-    print("SAME ORDERS, STRAIGHT FROM THE SOURCE TABLE")
-    print("=" * 78)
-    print(src.to_string(index=False))
-    print(f"\n  is_m0 = 1 anywhere above  -> NEVER_M0 is wrong; the June order_date filter")
-    print(f"                              dropped them, not a failed trial.")
-    print(f"  order_date outside June   -> confirms it.")
-    print(f"  is_m0 = 0 and collected>0 -> is_m0 does not mean what you were told.")
+print("=" * 80)
+print(f"TRUE NEGATIVES (correctly cut off) @ P(success) < {TN_THRESHOLD}")
+print("=" * 80)
+print(f"  {n_tn:,} of {len(df_pred):,} rows ({n_tn/len(df_pred):.1%}) -- comparing them to the other {n_rest:,}.\n")
+
+# Feature lists: categoricals/text from the artifact, numerics from the model's own list
+cat_prof = [c for c in (cat_features + text_features) if c in df_pred.columns]
+num_prof = [c for c in feature_names
+            if c not in cat_features and c not in text_features
+            and c in df_pred.columns and pd.api.types.is_numeric_dtype(df_pred[c])]
+
+# --- 1. CATEGORICAL: values over-represented among the cut-offs -------------
+# lift = (share within TN) / (share within the rest).  lift >> 1 == distinctive.
+cat_rows = []
+for col in cat_prof:
+    tn_c   = tn[col].astype('object').fillna('(missing)').astype(str).value_counts()
+    rest_c = rest[col].astype('object').fillna('(missing)').astype(str).value_counts()
+    for val, cnt in tn_c.items():
+        tn_share   = cnt / n_tn
+        rest_share = rest_c.get(val, 0) / n_rest
+        if cnt < 20 or tn_share < 0.02:          # drop rare / noisy categories
+            continue
+        cat_rows.append({'feature': col, 'value': val,
+                         'TN_%': round(100 * tn_share, 1),
+                         'rest_%': round(100 * rest_share, 1),
+                         'lift': round(tn_share / rest_share, 2) if rest_share else np.inf,
+                         'TN_n': int(cnt)})
+cat_profile = pd.DataFrame(cat_rows).sort_values('lift', ascending=False).reset_index(drop=True)
+
+print("--- Categorical values MOST over-represented among the cut-offs (top 20) ---")
+print(cat_profile.head(20).to_string(index=False) if len(cat_profile)
+      else "  (nothing cleared the support filter)")
+
+# --- 2. NUMERIC: features whose values differ most --------------------------
+# std_diff = (TN_mean - rest_mean) / overall_std.  >0 cut-offs run HIGHER, <0 LOWER.
+num_rows = []
+for col in num_prof:
+    s = df_pred[col]
+    std = s.std()
+    num_rows.append({'feature': col,
+                     'TN_median': round(s[tn_mask].median(), 3),
+                     'rest_median': round(s[rest_mask].median(), 3),
+                     'TN_mean': round(s[tn_mask].mean(), 3),
+                     'rest_mean': round(s[rest_mask].mean(), 3),
+                     'std_diff': round((s[tn_mask].mean() - s[rest_mask].mean()) / std, 3)
+                                 if std and std > 0 else 0.0})
+num_profile = pd.DataFrame(num_rows)
+num_profile = num_profile.reindex(num_profile['std_diff'].abs()
+                                  .sort_values(ascending=False).index).reset_index(drop=True)
+print("\n--- Numeric features that differ most (ranked by |std_diff|) ---")
+print("    std_diff > 0: cut-offs run HIGHER than the rest;  < 0: LOWER")
+print(num_profile.to_string(index=False)) 
+
+# --- 3. QUALITATIVE EXAMPLES: invoices we would cancel, most-confident first --
+top_cat = list(dict.fromkeys(cat_profile['feature'].tolist()))[:4] if len(cat_profile) else []
+top_num = num_profile['feature'].head(6).tolist()
+example_cols = [c for c in dict.fromkeys(['INVOICE_ID', 'SUCCESS_PROBABILITY', 'RETRIES'] + top_cat + top_num)
+                if c in df_pred.columns] 
+print("\n--- Example invoices we would cancel (lowest P(success) first) ---")
+print(df_pred.loc[tn_mask, example_cols].sort_values('SUCCESS_PROBABILITY').head(15).to_string(index=False))
+
+# --- 4. Visual: which numeric parameters separate the cut-offs from the rest --
+top_plot = num_profile.head(12).iloc[::-1]
+plt.figure(figsize=(10, 6))
+plt.barh(top_plot['feature'], top_plot['std_diff'],
+         color=['#d62728' if v > 0 else '#1f77b4' for v in top_plot['std_diff']])
+plt.axvline(0, color='k', lw=0.8)
+plt.title(f"What separates the invoices we cancel (P<{TN_THRESHOLD}, correctly)\n"
+          f"red = cut-offs run higher  ·  blue = cut-offs run lower")
+plt.xlabel("standardized mean difference vs. the rest")
+plt.tight_layout()
+plt.show()
 
 
-#%% Verdict: bucket every 'never-M0-but-collected' order by the two suspects
-# Cross-tabulates the source truth: did it EVER make M0, and is its order_date inside
-# the June window load_cltv() filters on? If the mass lands in (is_m0=1, outside June),
-# the date filter -- not is_m0 -- is what's dropping them from tb.
-if len(collected):
-    ids = ','.join(str(i) for i in collected.index)   # all of them, not just top 50
-    cur = ctx.cursor()
-    cur.execute(f"""
-    select
-        iff(is_m0_ever = 1, 'is_m0=1 (made M0)', 'is_m0=0 (true non-M0)') as m0_bucket,
-        june_bucket,
-        count(*)                    as orders,
-        round(sum(collected), 2)    as collected
-    from (
-        select order_id,
-               max(is_m0)                                                       as is_m0_ever,
-               iff(min(order_date) >= '2025-06-01'
-                   and max(order_date) < '2025-07-01', 'in June', 'outside June') as june_bucket,
-               sum(iff(transaction_status = 'accepted', transaction_amount, 0))  as collected
-        from DBT_PROD.ANALYTICS.FCT_TRANSACTION_INVOICE_ORDER_ITEM
-        where order_id in ({ids})
-        group by order_id
-    )
-    group by 1, 2
-    order by collected desc
-    """)
-    verdict = cur.fetch_pandas_all()
-    print("\n" + "=" * 78)
-    print("WHY THESE ORDERS ARE MISSING FROM tb  (source truth, all flagged orders)")
-    print("=" * 78)
-    print(verdict.to_string(index=False))
-    print("\n  Rows in 'is_m0=1 (made M0)' + 'outside June' == the load_cltv date filter")
-    print("  is throwing away real M0 orders. Fix: widen/remove the order_date window in")
-    print("  load_cltv() to match df_pred's range, or key NEVER_M0 off is_m0, not the merge.")
 
-# =============================================================================
-# How big is the exposure? Free cuts are 76% of every cut you make.
-# =============================================================================
-print("\n" + "=" * 78)
-print("WHAT IF THE FREE CUTS AREN'T FREE?")
-print("=" * 78)
-free_at_002 = 25714   # from your p<0.02 row
-net_at_002 = 3359.43
-print(f"  Net @ p<0.02 : ${net_at_002:,.2f} on {free_at_002:,} free cuts")
-for per_order in [0.05, 0.10, 0.13, 0.20, 0.50]:
-    adj = net_at_002 - free_at_002 * per_order
-    flag = '  <-- Net goes NEGATIVE' if adj < 0 else ''
-    print(f"  if each free cut really costs ${per_order:.2f} -> Net ${adj:>10,.2f}{flag}")
-# %%
+#%% 
