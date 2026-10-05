@@ -20,18 +20,19 @@ from scipy.stats import zscore
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score, mean_squared_error, mean_absolute_error, root_mean_squared_error
 from catboost import CatBoostClassifier
-from lightgbm import LGBMRegressor 
 from sklearn.model_selection import TimeSeriesSplit
 from catboost import CatBoostRegressor
 import warnings
 warnings.filterwarnings("ignore")  
 
 from sklearn.linear_model import LassoCV
-import statsmodels.api as sm
 from dateutil.relativedelta import relativedelta
 
 from snowflake.connector.pandas_tools import write_pandas
 from datetime import date
+import os
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())          # Snowflake credentials live in the repo-root .env file
 
 
 # In[2]:
@@ -39,14 +40,23 @@ from datetime import date
 
 pd.set_option('display.max_columns', None)
 
+
+# In[3]:
+
+
 url = URL(
-    user='BITEAM',
-    password='B1sense@22',
-    account='YXBYZCG-MVA06208',
-    database="DBT_PROD.PUBLIC",
+    user=os.environ["SNOWFLAKE_USER"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
+    password=os.environ["SNOWFLAKE_TOKEN"], 
+    database="dbt_prod",
+    warehouse="COMPUTE_WH"       
 )
-engine = create_engine(url) 
+
+engine = create_engine(url)
 connection = engine.connect()
+
+
+# In[7]:
 
 
 holiday_function = '''
@@ -240,8 +250,7 @@ exclude_cols = [
 
 feature_cols = [col for col in df_clean.columns if col not in exclude_cols]
 cat_features = ['day_name', 'month_name'] # CatBoost handles these natively  
-
-# --------------------------------------------------------------
+# ------------------------------------------------------------------
 # 2. ISOLATE THE FINAL HOLDOUT SET
 # -------------------------------------------------------------------
 # The last 100 days are locked away for the ultimate deployment test
@@ -478,10 +487,10 @@ def append(df, tb_name):
     
     # connect
     conn = snowflake.connector.connect(
-    user="BITEAM", 
-    password="B1sense@22", 
-    account="YXBYZCG-MVA06208",
-    warehouse="PC_DBT_WH",
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_TOKEN"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
+    warehouse="COMPUTE_WH",
     database="ANALYTICS",
     schema="CALL_VOLUME_PREDICTION_PROJECT"
     )
@@ -696,19 +705,10 @@ df_intraday['predicted_calls_30mins'] = df_intraday['PREDICTED_CALLS'] * df_intr
 
 df_intraday = df_intraday[['DATE','day_of_week', 'time_of_day','predicted_calls_30mins']]  
 
-
-# In[50]:
-
-
-df_intraday.dtypes
-
-
 # In[73]:
 
 
 append(df = df_intraday, tb_name = 'CALL_VOLUME_PREDICTIONS_30_MIN') 
-
-
 
 
 

@@ -15,9 +15,8 @@ Bins are defined once on the whole-vertical data, then partner 948018's rows are
 scored into those exact buckets — so every row compares like-for-like.
 
 SETUP:
-    pip install "snowflake-connector-python[pandas]" openpyxl pandas numpy
-    export SNOWFLAKE_ACCOUNT=... SNOWFLAKE_USER=... SNOWFLAKE_PASSWORD=... \
-           SNOWFLAKE_WAREHOUSE=... SNOWFLAKE_ROLE=... SNOWFLAKE_DATABASE=ANALYTICS
+    pip install "snowflake-connector-python[pandas]" openpyxl pandas numpy python-dotenv
+    Snowflake credentials are read from the repo-root .env file (see .env.example).
 RUN:
     python m0_conversion_by_attribute_compare.py
 """
@@ -30,6 +29,8 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.formatting.rule import ColorScaleRule
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())          # Snowflake credentials live in the repo-root .env file
 
 warnings.filterwarnings("ignore")
 
@@ -231,9 +232,9 @@ def build_query(partner_id):
 def fetch(partner_id) -> pd.DataFrame:
     import snowflake.connector
     conn = snowflake.connector.connect(
-    user='BITEAM',
-    password='B1sense@22',
-    account='YXBYZCG-MVA06208',
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_TOKEN"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
     database="DBT_PROD.PUBLIC",
     )
     try:

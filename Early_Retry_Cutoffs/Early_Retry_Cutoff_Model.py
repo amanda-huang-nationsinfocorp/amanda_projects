@@ -18,13 +18,15 @@ import joblib
 from sklearn.frozen import FrozenEstimator
 import matplotlib.pyplot as plt
 from catboost import CatBoostClassifier, Pool
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())          # Snowflake credentials live in the repo-root .env file
 
 #%%  Fetch Data from Snowflake
 # Start fetching data directly from Snowflake
 ctx = snowflake.connector.connect(
-    user='BITEAM',
-    password='B1sense@22',
-    account='YXBYZCG-MVA06208',
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_TOKEN"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
     database="DBT_PROD.PUBLIC",
     warehouse='COMPUTE_WH',
     schema='EARLY_RETRY_CUTOFF'
@@ -387,10 +389,10 @@ print("Extracting feature names from the nested model...")
 # Dig into the CalibratedClassifierCV
 if hasattr(calibrated_model, 'calibrated_classifiers_'):
     base_wrapper = calibrated_model.calibrated_classifiers_[0].estimator
-else:
+else: 
     base_wrapper = calibrated_model.estimator
 
-# Dig into your custom FrozenEstimator
+# Dig into your custom FrozenEstimator 
 if hasattr(base_wrapper, 'estimator'):
     actual_catboost = base_wrapper.estimator
 elif hasattr(base_wrapper, 'model'):
@@ -401,9 +403,9 @@ else:
 # Extract the feature names directly from the underlying CatBoost object
 feature_names = actual_catboost.feature_names_
 
-print("Generating predictions...")
+print("Generating predictions...") 
 
-# Ensure column order matches training exactly
+# Ensure column order matches training exactly 
 X_new = X_new[feature_names]
 
 # Get the probability of the positive class
@@ -469,7 +471,7 @@ def plot_business_confusion_matrix(y_true, y_probs, threshold=0.05, dataset_name
                 yticklabels=['Actual Fail (0)', 'Actual Success (1)'])
 
     plt.title(f'Confusion Matrix: {dataset_name}\n(Threshold: {threshold})', fontsize=14, pad=15)
-    plt.xlabel('What the Model Predicted', fontsize=12, labelpad=10)
+    plt.xlabel('What the Model Predicted', fontsize=12, labelpad=10)                                                                                                 
     plt.ylabel('What Actually Happened', fontsize=12, labelpad=10)
     plt.tight_layout()
     plt.show()

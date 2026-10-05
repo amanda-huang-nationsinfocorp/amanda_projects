@@ -1,0 +1,13 @@
+# Secrets -- Snowflake credentials live here (template: .env.example)
+.env
+
+# Python / Jupyter build artifacts
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# CatBoost training logs
+catboost_info/
+
+# macOS
+.DS_Store

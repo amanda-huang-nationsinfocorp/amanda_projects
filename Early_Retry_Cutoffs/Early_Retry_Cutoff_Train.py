@@ -10,13 +10,15 @@ from catboost import CatBoostClassifier, Pool
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())          # Snowflake credentials live in the repo-root .env file
 
 #%%  Fetch Data from Snowflake
 # Start fetching data directly from Snowflake
 ctx = snowflake.connector.connect(
-    user='BITEAM',
-    password='B1sense@22',
-    account='YXBYZCG-MVA06208',
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_TOKEN"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
     database="DBT_PROD.PUBLIC",
     warehouse='COMPUTE_WH',
     schema='EARLY_RETRY_CUTOFF'
@@ -99,7 +101,7 @@ drop_cols = ['ORDER_ID', 'INVOICE_ID', 'TRANSACTION_ID', 'TRANSACTION_DATETIME',
 text_features = [col for col in ['SUPER_PARTNER_ID_NAME', 'BANK'] if col in sampled_df.columns]
 
 # Get remaining categorical features (Using errors='ignore' safely)
-cat_features = sampled_df.drop(columns=drop_cols, errors='ignore').select_dtypes(include=['object', 'category']).columns.tolist()
+cat_features = sampled_df.drop(columns=drop_cols, errors='ignore').select_dtypes(include=['object', 'str', 'category']).columns.tolist()
 cat_features = [c for c in cat_features if c not in text_features]
 
 # Vectorized Imputation BEFORE the split (Massive speedup)

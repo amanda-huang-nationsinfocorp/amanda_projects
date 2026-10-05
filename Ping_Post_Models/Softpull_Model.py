@@ -13,17 +13,19 @@ from sqlalchemy import create_engine, text
 from snowflake.sqlalchemy import URL
 from datetime import datetime, timedelta, timezone
 import pytz
+import os
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())          # Snowflake credentials live in the repo-root .env file
 
 
 
 # In[6]:
-
-
 url = URL(
-    ='BITEAM',
-    password='B1sense@22',
-    account='YXBYZCG-MVA06208',
-    database="DBT_PROD.PUBLIC",
+    user=os.environ["SNOWFLAKE_USER"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
+    password=os.environ["SNOWFLAKE_TOKEN"], 
+    database="dbt_prod",
+    warehouse="COMPUTE_WH"       
 )
 engine = create_engine(url)
 connection = engine.connect()
@@ -242,7 +244,7 @@ final AS (
         tl.latest_account_open_year,
         tl.derogatory_account_count,
         tl.derogatory_account_ratio,
-        tl.closed_derogatory_account_ratio,
+        tl.closed_derogatory_account_ratio, 
         tl.paid_account_count,
         tl.transferred_account_count,
         tl.on_time_payment_current_ratio,
@@ -316,7 +318,7 @@ date_cols = [
 ]
 
 for col in date_cols:
-    if col in df.columns:
+    if col in df.columns:  
         df[col] = pd.to_datetime(df[col], errors='coerce')
 
 # 2. Identify categorical and numeric columns
@@ -331,7 +333,7 @@ df[numeric_cols] = df[numeric_cols].fillna(0)
 
 
 # %% DATA TRANSFORMATION (PingPost)
-# Data transformation (PingPost) starts here
+# Data transformation (PingPost) starts here 
 df['is_m0'] = (df['label'].str.strip().str.lower() == 'm0').astype(int)
 
 def get_resident_status(applicant_current_address_residence_status: str) -> str:

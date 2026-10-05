@@ -32,6 +32,9 @@ from dateutil.relativedelta import relativedelta
 
 from snowflake.connector.pandas_tools import write_pandas
 from datetime import date
+import os
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())          # Snowflake credentials live in the repo-root .env file
 
 
 # In[2]:
@@ -44,9 +47,9 @@ pd.set_option('display.max_columns', None)
 
 
 url = URL(
-    user='BITEAM',
-    password='B1sense@22',
-    account='YXBYZCG-MVA06208',
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_TOKEN"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
     database="DBT_PROD.PUBLIC",
 )
 engine = create_engine(url) 
@@ -491,9 +494,9 @@ def append(df):
     
     # connect
     conn = snowflake.connector.connect(
-    user="BITEAM",
-    password="B1sense@22",
-    account="YXBYZCG-MVA06208",
+    user=os.environ["SNOWFLAKE_USER"],
+    password=os.environ["SNOWFLAKE_TOKEN"],
+    account=os.environ["SNOWFLAKE_ACCOUNT"],
     warehouse="PC_DBT_WH",
     database="ANALYTICS",
     schema="CALL_VOLUME_PREDICTION_PROJECT"
