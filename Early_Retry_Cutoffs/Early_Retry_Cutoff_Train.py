@@ -31,12 +31,12 @@ cur.execute("SELECT * FROM ANALYTICS.EARLY_RETRY_CUTOFF.EARLY_RETRY_CUTOFF_DATA"
 
 # 3. Fetch directly to a Pandas DataFrame using Arrow
 # This is drastically faster than pd.read_sql()
-df = cur.fetch_pandas_all()
-print(f"Fetched {len(df):,} rows from Snowflake.")
+sampled_df = cur.fetch_pandas_all()
+print(f"Fetched {len(sampled_df):,} rows from Snowflake.")
 
 #%% Model Training
 # Model Training Starts Here
-sampled_df = df
+# (Data is fetched straight into sampled_df above -- a separate `df` name kept an extra full copy alive all run)
 
 # Must match the DATEDIFF threshold in the training SQL's in-flight filter
 MATURITY_DAYS = 30
@@ -80,10 +80,9 @@ if invoice_times['RESOLVED_AT'].isna().any():
         "but have no accepted transaction. Did the != 'accepted' filter get left in the SQL?"
     )
 
-sampled_df = sampled_df.merge(
-    invoice_times[['INVOICE_START', 'INVOICE_LAST_TXN', 'RESOLVED_AT']],
-    left_on='INVOICE_ID', right_index=True, how='left'
-)
+# Add the invoice-level columns in place -- .merge() built a second full copy of the table
+for _col in ['INVOICE_START', 'INVOICE_LAST_TXN', 'RESOLVED_AT']:
+    sampled_df[_col] = sampled_df['INVOICE_ID'].map(invoice_times[_col])
 
 # Now drop the accepted rows -- at serving time the model only ever scores declines.
 #sampled_df = sampled_df[sampled_df['TRANSACTION_STATUS'] != 'accepted'].reset_index(drop=True)
@@ -139,19 +138,24 @@ past_invoices = mature_invoices[mature_invoices['INVOICE_START'] < split_date].i
 oot_invoices  = mature_invoices[mature_invoices['INVOICE_START'] >= split_date].index
 
 # 6. Build the final dataframes (keeping all transactions tied to these invoices)
-past_data = sampled_df[sampled_df['INVOICE_ID'].isin(past_invoices)].copy()
-oot_test_df = sampled_df[sampled_df['INVOICE_ID'].isin(oot_invoices)].copy()
+# No .copy(): boolean filtering already returns a new frame. OOT is named X_oot_test from the
+# start -- its target/ID columns are dropped in step 4 by reusing the same name.
+past_data  = sampled_df[sampled_df['INVOICE_ID'].isin(past_invoices)]
+X_oot_test = sampled_df[sampled_df['INVOICE_ID'].isin(oot_invoices)]
 
 # Safety check: Ensure no invoice exists in both datasets
-assert not (set(past_data['INVOICE_ID']) & set(oot_test_df['INVOICE_ID'])), \
+assert not (set(past_data['INVOICE_ID']) & set(X_oot_test['INVOICE_ID'])), \
     "Error: Invoices straddle the split boundary"
 
 print(f"  past_data   : {len(past_data):>9,} rows | {past_data['ORDER_ID'].nunique():>7,} orders")
-print(f"  oot_test_df : {len(oot_test_df):>9,} rows | {oot_test_df['ORDER_ID'].nunique():>7,} orders")
+print(f"  oot_test_df : {len(X_oot_test):>9,} rows | {X_oot_test['ORDER_ID'].nunique():>7,} orders")
 print(f"  orders in both (expected if customers return): "
-      f"{len(set(past_data['ORDER_ID']) & set(oot_test_df['ORDER_ID'])):,}")
+      f"{len(set(past_data['ORDER_ID']) & set(X_oot_test['ORDER_ID'])):,}")
 print(f"  dropped (immature, still in-flight): "
-      f"{len(sampled_df) - len(past_data) - len(oot_test_df):,} rows")
+      f"{len(sampled_df) - len(past_data) - len(X_oot_test):,} rows")
+
+# Full table no longer needed. (del, not a rename: sampled_df feeds two frames.)
+del sampled_df
 
 
 # hashlib rather than hash(): Python salts str hashing per process, so hash() would
@@ -168,31 +172,37 @@ order_frac = pd.Series(order_hash_frac(unique_orders), index=unique_orders)
 row_frac = past_data['ORDER_ID'].map(order_frac)
 
 # Same 75 / 10 / 10 / 5 boundaries as before -- but over ORDERS, not rows.
-train_df       = past_data[row_frac < 0.75].copy()
-stop_df        = past_data[(row_frac >= 0.75) & (row_frac < 0.85)].copy()
-calib_df       = past_data[(row_frac >= 0.85) & (row_frac < 0.95)].copy()
-random_test_df = past_data[row_frac >= 0.95].copy()
+# Named X_* from the start -- target/ID columns are dropped in step 4 by reusing the same name.
+X_train       = past_data[row_frac < 0.75]
+X_stop        = past_data[(row_frac >= 0.75) & (row_frac < 0.85)]
+X_calib       = past_data[(row_frac >= 0.85) & (row_frac < 0.95)]
+X_random_test = past_data[row_frac >= 0.95]
 
-for _name, _part in [('train_df', train_df), ('stop_df', stop_df),
-                     ('calib_df', calib_df), ('random_test_df', random_test_df)]:
+# past_data is fully split above. (del, not a rename: it feeds four frames.)
+del past_data
+
+for _name, _part in [('train_df', X_train), ('stop_df', X_stop),
+                     ('calib_df', X_calib), ('random_test_df', X_random_test)]:
     print(f"  {_name:<15}: {len(_part):>9,} rows | {_part['ORDER_ID'].nunique():>7,} orders "
           f"| base rate {_part['IS_EVENTUALLY_SUCCESSFUL'].mean():.4f}")
 
-for _a, _b in [('train_df', train_df), ('stop_df', stop_df),
-               ('calib_df', calib_df), ('random_test_df', random_test_df)]:
-    for _c, _d in [('train_df', train_df), ('stop_df', stop_df),
-                   ('calib_df', calib_df), ('random_test_df', random_test_df)]:
+for _a, _b in [('train_df', X_train), ('stop_df', X_stop),
+               ('calib_df', X_calib), ('random_test_df', X_random_test)]:
+    for _c, _d in [('train_df', X_train), ('stop_df', X_stop),
+                   ('calib_df', X_calib), ('random_test_df', X_random_test)]:
         if _a < _c:
             assert not (set(_b['ORDER_ID']) & set(_d['ORDER_ID'])), f"{_a}/{_c} share orders"
 print("  [ok] no ORDER_ID spans two splits")
+del _part, _b, _d   # loop variables still point at the last full split frame
 
 # 4. Separate X and y (Using errors='ignore' safely)
-X_train, y_train = train_df.drop(columns=drop_cols, errors='ignore'), train_df['IS_EVENTUALLY_SUCCESSFUL']
-X_stop,  y_stop  = stop_df.drop(columns=drop_cols, errors='ignore'),  stop_df['IS_EVENTUALLY_SUCCESSFUL']
-X_calib, y_calib = calib_df.drop(columns=drop_cols, errors='ignore'), calib_df['IS_EVENTUALLY_SUCCESSFUL']
+# Reusing each X_* name replaces the full split frame instead of keeping a second copy.
+X_train, y_train = X_train.drop(columns=drop_cols, errors='ignore'), X_train['IS_EVENTUALLY_SUCCESSFUL']
+X_stop,  y_stop  = X_stop.drop(columns=drop_cols, errors='ignore'),  X_stop['IS_EVENTUALLY_SUCCESSFUL']
+X_calib, y_calib = X_calib.drop(columns=drop_cols, errors='ignore'), X_calib['IS_EVENTUALLY_SUCCESSFUL']
 
-X_random_test, y_random_test = random_test_df.drop(columns=drop_cols, errors='ignore'), random_test_df['IS_EVENTUALLY_SUCCESSFUL']
-X_oot_test,    y_oot_test    = oot_test_df.drop(columns=drop_cols, errors='ignore'),    oot_test_df['IS_EVENTUALLY_SUCCESSFUL']
+X_random_test, y_random_test = X_random_test.drop(columns=drop_cols, errors='ignore'), X_random_test['IS_EVENTUALLY_SUCCESSFUL']
+X_oot_test,    y_oot_test    = X_oot_test.drop(columns=drop_cols, errors='ignore'),    X_oot_test['IS_EVENTUALLY_SUCCESSFUL']
 
 # =====================================================================
 # 4. Create Memory-Efficient CatBoost Pools
